@@ -1,0 +1,6 @@
+[submodule "thirdparty/IsaacLab"]
+	path = thirdparty/IsaacLab
+	url = https://github.com/isaac-sim/IsaacLab.git
+[submodule "thirdparty/mujoco"]
+	path = thirdparty/mujoco
+	url = https://github.com/google-deepmind/mujoco.git
