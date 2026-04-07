@@ -23,7 +23,7 @@ setup(
     "opencv-python",
     "natsort",
     "psutil",
-    "smplx @ git+https://github.com/vchoutas/smplx",
+    "smplx",
     "protobuf",
     "redis[hiredis]",
     "imageio[ffmpeg]",
