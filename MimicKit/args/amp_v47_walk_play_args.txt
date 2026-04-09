@@ -1,0 +1,6 @@
+--mode test
+--num_envs 1
+--engine_config data/engines/isaac_gym_engine.yaml
+--env_config data/envs/amp_v47_walk_env.yaml
+--agent_config data/agents/amp_v47_walk_agent.yaml
+--model_file output/amp_mvr_22dof/2026-0402_211536/model.pt

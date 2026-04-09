@@ -1,0 +1,8 @@
+--mode train
+--num_envs 4096
+--engine_config data/engines/isaac_gym_engine.yaml
+--env_config data/envs/amp_v47_walk_env.yaml
+--agent_config data/agents/amp_v47_walk_agent.yaml
+--out_dir output/amp_v47_walk/
+--logger wandb
+--visualize false

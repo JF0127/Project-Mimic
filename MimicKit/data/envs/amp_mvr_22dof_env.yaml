@@ -1,6 +1,8 @@
 env_name: "amp"
-
-char_file: "data/assets/mvr_22dof/Mvr_22dof.xml"
+# ====== 非对称观测开关 ======
+asymmetric_obs: True  # True: Actor无特权(187), Critic全量(206)。False: 原始对称AC
+# ================================
+char_file: "data/assets/mvr_22dof/mjcf/Mvr_22dof.xml"
 camera_mode: "track"
 
 episode_length: 10.0 # seconds
@@ -11,17 +13,44 @@ enable_phase_obs: False
 enable_tar_obs: False
 num_disc_obs_steps: 10
 rand_reset: True
-zero_center_action: True
+zero_center_action: False
 
 ref_char_offset: [2.0, 0.0, 0.0] # m
+init_pose: [
+    0.0, 0.0, 0.8,  # Root Position (x, y, z)
+    0.0, 0.0, 0.0,  # Root Rotation (Roll, Pitch, Yaw)
+    -0.25,  -0.03,  -0.01,  -0.5,  0.23,   -0.01,
+    0.25,   0.03,   -0.01,  0.5,   -0.23,  0.01,
+    0,0,
+    0,   0,0,    -1,
+    0,    0,0,    1,
+  ]
 
-# root (x, y, z, rx, ry, rz) + 22 joints (all zero = nominal standing pose)
-# joint order: L-leg(6) R-leg(6) waist head L-arm(4) R-arm(4)
-init_pose: [0, 0, 0.8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-
+init_pose_real: [
+    0.0, 0.0, 0.62,  # Root Position (x, y, z)
+    0.0, 0.0, 0,     # Root Rotation (Roll, Pitch, Yaw)
+     -0.25, -0.03, -0.01, -0.5,  0.15, -0.01,
+    0.25,   0.03, 0.01,  0.5, -0.15,  0.01,
+    0,0,
+    0,   0,0,    -1,
+    0,    0,0,    1,
+  ]
 enable_early_termination: True
-key_bodies: ["head_link", "left_ankle_roll_link", "right_ankle_roll_link", "left_hand_link", "right_hand_link"]
-contact_bodies: ["left_knee_link", "left_ankle_pitch_link", "left_ankle_roll_link", "right_knee_link", "right_ankle_pitch_link", "right_ankle_roll_link"]
+key_bodies: [
+  "head_link",
+  "right_hand_link",
+  "left_hand_link",
+  "right_ankle_roll_link",
+  "left_ankle_roll_link"
+]
+contact_bodies: [
+  "left_knee_link",
+  "left_ankle_pitch_link",
+  "left_ankle_roll_link",
+  "right_knee_link",
+  "right_ankle_pitch_link",
+  "right_ankle_roll_link"
+]
 
 motion_file: "data/motions/mvr_22dof/mvr_marktime.pkl"
 
@@ -36,3 +65,50 @@ reward_vel_scale: 0.01
 reward_root_pose_scale: 5.0
 reward_root_vel_scale: 1.0
 reward_key_pos_scale: 10.0
+
+# ====== 状态初始化配置 ======
+state_init_mode: "Real"  # 选项: "Ref", "Init", "Zero", "Real", "Hybrid"
+
+# Hybrid 模式下的概率分布 [参考动作帧, YAML初始位姿, 全0位姿, 真实初始位姿]
+hybrid_init_probs: [0.3, 0.15, 0.15, 0.4]
+
+# 初始化扰动的标准差 [root_pos_xy, root_rot_euler, dof_pos, dof_vel]
+init_noise_std: [0.02, 0.05, 0.02, 0.01]
+
+# 逐关节非对称初始噪声 (长度 22)
+init_noise_std_dof: [
+  0.006, 0.033, 0.002, 0.055, 0.166, 0.017,  # 左腿 DoF 0-5
+  0.006, 0.033, 0.002, 0.055, 0.166, 0.017,  # 右腿 DoF 6-11
+  0.071, 0.005,                               # 腰部, 头部 DoF 12-13
+  0.118, 0.032, 0.033, 0.098,                 # 左臂 DoF 14-17
+  0.118, 0.032, 0.033, 0.098                  # 右臂 DoF 18-21
+]
+
+# ==================================
+use_commands: False
+enable_mirror_aug: False
+# ====== RMA 状态估计开关 ======
+enable_rma: True
+# ==============================
+obs_noise: True
+
+# ====== 外力扰动 ======
+domain_rand:
+  push_robots: True
+  push_interval_s: 8
+  push_duration_s: 0.4
+  max_push_force: 80
+  push_bodies: ["waist_link"]
+# ==================================
+
+# 逐关节发力游隙阈值
+enable_action_pd_limit: False
+action_pd_threshold: [
+  0.10, 0.10, 0.10, 0.15, 0.25, 0.10,  # 左腿 DoF 0-5
+  0.10, 0.10, 0.10, 0.15, 0.25, 0.10,  # 右腿 DoF 6-11
+  0.15, 0.10,                           # 腰部, 头部 DoF 12-13
+  0.20, 0.10, 0.10, 0.20,               # 左臂 DoF 14-17
+  0.20, 0.10, 0.10, 0.20                # 右臂 DoF 18-21
+]
+
+use_physical_bound_loss: True

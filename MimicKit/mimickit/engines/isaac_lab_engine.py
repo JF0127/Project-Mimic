@@ -36,8 +36,8 @@ def str_to_key_code(key_str):
     return key_code
 
 class ObjCfg:
-    def __init__(self, obj_type, asset_file, is_visual, enable_self_collisions, 
-                fix_root, start_pos, start_rot, color, disable_motors):
+    def __init__(self, obj_type, asset_file, is_visual, enable_self_collisions,
+                fix_root, start_pos, start_rot, color, disable_motors, init_joint_pos=None):
         self.obj_type = obj_type
         self.asset_file = asset_file
         self.is_visual = is_visual
@@ -47,6 +47,7 @@ class ObjCfg:
         self.start_rot = start_rot
         self.color = color
         self.disable_motors = disable_motors
+        self.init_joint_pos = init_joint_pos if init_joint_pos is not None else {}
         return
     
     def is_valid_clone(self, other):
@@ -146,9 +147,9 @@ class IsaacLabEngine(engine.Engine):
         self._clear_forces()
         return
 
-    def create_obj(self, env_id, obj_type, asset_file, name, is_visual=False, enable_self_collisions=True, 
-                   fix_root=False, start_pos=None, start_rot=None, 
-                   color=None, disable_motors=False):
+    def create_obj(self, env_id, obj_type, asset_file, name, is_visual=False, enable_self_collisions=True,
+                   fix_root=False, start_pos=None, start_rot=None,
+                   color=None, disable_motors=False, init_joint_pos=None):
         if (start_rot is None):
             start_rot = np.array([1.0, 0.0, 0.0, 0.0])
         else:
@@ -163,14 +164,15 @@ class IsaacLabEngine(engine.Engine):
         start_pos[1] += self._env_offsets[env_id, 1]
 
         obj_cfg = ObjCfg(obj_type=obj_type,
-                         asset_file=asset_file, 
-                         is_visual=is_visual, 
+                         asset_file=asset_file,
+                         is_visual=is_visual,
                          enable_self_collisions=enable_self_collisions,
-                         fix_root=fix_root, 
-                         start_pos=start_pos, 
+                         fix_root=fix_root,
+                         start_pos=start_pos,
                          start_rot=start_rot,
-                         color=color, 
-                         disable_motors=disable_motors)
+                         color=color,
+                         disable_motors=disable_motors,
+                         init_joint_pos=init_joint_pos)
         
         obj_id = len(self._obj_cfgs[env_id])
         self._obj_cfgs[env_id].append(obj_cfg)
@@ -926,7 +928,8 @@ class IsaacLabEngine(engine.Engine):
         actuator_cfg = self._build_actuator_cfg(control_mode)
 
         prim_path = OBJ_PATH_TEMPLATE.format(env_id, obj_id)
-        init_state = ArticulationCfg.InitialStateCfg(pos=obj_cfg.start_pos, rot=obj_cfg.start_rot)
+        init_state = ArticulationCfg.InitialStateCfg(pos=obj_cfg.start_pos, rot=obj_cfg.start_rot,
+                                                      joint_pos=obj_cfg.init_joint_pos)
         
         art_cfg = ArticulationCfg(prim_path=prim_path, spawn=usd_cfg, collision_group=0,
                                   init_state=init_state,

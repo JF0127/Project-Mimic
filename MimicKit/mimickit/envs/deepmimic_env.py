@@ -9,6 +9,7 @@ import engines.engine as engine
 import util.stats_tracker as stats_tracker
 import util.torch_util as torch_util
 
+
 class DeepMimicEnv(char_env.CharEnv):
     def __init__(self, env_config, engine_config, num_envs, device, visualize, record_video=False):
         self._enable_early_termination = env_config["enable_early_termination"]
@@ -38,14 +39,93 @@ class DeepMimicEnv(char_env.CharEnv):
         self._reward_key_pos_scale = env_config.get("reward_key_pos_scale")
         
         self._visualize_ref_char = env_config.get("visualize_ref_char", True)
-        
+
+        # ====== 新增：状态初始化域随机配置 ======
+        self._state_init_mode = env_config.get("state_init_mode", "Ref")
+        self._hybrid_init_probs = env_config.get("hybrid_init_probs", [1.0, 0.0, 0.0])
+        self._init_noise_std = env_config.get("init_noise_std", [0.0, 0.0, 0.0])
+        # ==================================
+        self.use_commands = env_config.get("use_commands", False)
+
+        # ====== 新增：读取非对称与 RMA 开关 ======
+        self._asymmetric_obs = env_config.get("asymmetric_obs", False)
+        self._enable_rma = env_config.get("enable_rma", False) if not self._asymmetric_obs else False
+        self._rma_hist_len = engine_config.get("control_freq", 30)
+        self.obs_noise = env_config.get("obs_noise", False)
+        # self._rma_hist_len = env_config.get("rma_hist_len", 30)
+        # 记录维度，方便外层 Agent/Model 知道如何切片
+        self.prop_dim = 0
+        self.priv_dim = 0
+        self.hist_dim = 0
+        self._prop_hist_buf = None
+        self._enable_se = env_config.get("enable_se", False) if not self._asymmetric_obs else False  # <--- 新增
+        # ==========================================
+        self._enable_mirror_aug = env_config.get("enable_mirror_aug", False)
+        if self._enable_mirror_aug:
+            mirror_cfg = env_config.get("mirror_aug_config", {})
+            # 存为 tensor 方便后续做 GPU 上的高效切片
+            self._mirror_neg_idx = torch.tensor(mirror_cfg.get("negate_indices", []), dtype=torch.long,
+                                                device=self._device)
+            self._mirror_left_idx = torch.tensor(mirror_cfg.get("left_indices", []), dtype=torch.long,
+                                                 device=self._device)
+            self._mirror_right_idx = torch.tensor(mirror_cfg.get("right_indices", []), dtype=torch.long,
+                                                  device=self._device)
+            assert len(self._mirror_left_idx) == len(self._mirror_right_idx), "左侧和右侧的索引长度必须一致！"
+
+        # ====== 新增：外力扰动配置 ======
+        dr_cfg = env_config.get("domain_rand", {})
+        self._enable_push = dr_cfg.get("push_robots", False)
+        if self._enable_push:
+            self._push_interval = dr_cfg.get("push_interval_s", 3.0)
+            self._push_duration = dr_cfg.get("push_duration_s", 0.4)
+            self._max_push_force = dr_cfg.get("max_push_force", 150.0)
+            self._push_body_names = dr_cfg.get("push_bodies", ["head_link"])
+        # ================================
+        # ====== 新增：状态初始化域随机配置 ======
+        self._state_init_mode = env_config.get("state_init_mode", "Ref")
+        self._hybrid_init_probs = env_config.get("hybrid_init_probs", [1.0, 0.0, 0.0])
+        self._init_noise_std = env_config.get("init_noise_std", [0.0, 0.0, 0.0, 0.0])  # <--- 这里加一个 0.0
+        # >>> 新增：读取逐关节非对称噪声数组 >>>
+        self._init_noise_std_dof = env_config.get("init_noise_std_dof", None)
+        if self._init_noise_std_dof is not None:
+            self._init_noise_std_dof = torch.tensor(self._init_noise_std_dof, device=device, dtype=torch.float32)
+        # <<< 结束新增 <<<
         super().__init__(env_config=env_config, engine_config=engine_config,
                          num_envs=num_envs, device=device, visualize=visualize,
                          record_video=record_video)
         return
-    
+
+    # 新增通用镜像函数
+    def _apply_mirror_aug(self, obs):
+        """对输入的 amp_obs 批量应用镜像翻转"""
+        flipped_obs = obs.clone()
+
+        # 1. 对应维度取反 (比如 Y 轴移动，Yaw/Roll 旋转)
+        if len(self._mirror_neg_idx) > 0:
+            flipped_obs[:, self._mirror_neg_idx] *= -1.0
+
+        # 2. 左右对称肢体数据互换
+        if len(self._mirror_left_idx) > 0:
+            left_data = obs[:, self._mirror_left_idx].clone()
+            right_data = obs[:, self._mirror_right_idx].clone()
+            flipped_obs[:, self._mirror_left_idx] = right_data
+            flipped_obs[:, self._mirror_right_idx] = left_data
+
+        return flipped_obs
+
+    def get_critic_obs_space(self):
+        import gymnasium.spaces as spaces
+        import numpy as np
+        if hasattr(self, "_critic_obs_buf"):
+            shape = list(self._critic_obs_buf.shape[1:])
+            import util.torch_util as torch_util
+            dtype = torch_util.torch_dtype_to_numpy(self._critic_obs_buf.dtype)
+        else:
+            return self.get_obs_space()
+        return spaces.Box(low=-np.inf, high=np.inf, shape=shape, dtype=dtype)
+
     def get_reward_succ(self):
-        # setting the success reward to 0 at the end of the motion avoids the
+        # setting the done flag flat to fail at the end of the motion avoids the
         # local minimal of a character just standing still until the end of the motion
         return 0.0
     
@@ -56,23 +136,9 @@ class DeepMimicEnv(char_env.CharEnv):
         super().set_mode(mode)
 
         if (self._mode == base_env.EnvMode.TEST):
-            if (self._log_tracking_error):
+            if (self._log_tracking_error):      # ×
                 self._error_tracker.reset()
         return
-    
-    def record_diagnostics(self):
-        if (self._log_tracking_error):
-            err_stats = self._error_tracker.get_mean()
-            self._diagnostics["root_pos_err"] = err_stats[0]
-            self._diagnostics["root_rot_err"] = err_stats[1]
-            self._diagnostics["body_pos_err"] = err_stats[2]
-            self._diagnostics["body_rot_err"] = err_stats[3]
-            self._diagnostics["dof_vel_err"] = err_stats[4]
-            self._diagnostics["root_vel_err"] = err_stats[5]
-            self._diagnostics["root_ang_vel_err"] = err_stats[6]
-
-        diag = super().record_diagnostics()
-        return diag
 
     def _build_sim_tensors(self, env_config):
         super()._build_sim_tensors(env_config)
@@ -106,7 +172,122 @@ class DeepMimicEnv(char_env.CharEnv):
 
         joint_err_w = env_config.get("joint_err_w", None)
         self._parse_joint_err_weights(joint_err_w)
+
+        self.commands = torch.zeros((self.get_num_envs(), 3), device=self._device, dtype=torch.float)
+        self.command_resample_steps = torch.zeros(self.get_num_envs(), device=self._device, dtype=torch.long)
+
+        # ====== 新增：外力扰动 Buffer ======
+        if getattr(self, "_enable_push", False):
+            # 将 body 名字映射为底层的 body_id
+            self._push_body_ids = self._build_body_ids_tensor(self._push_body_names)
+            num_envs = self.get_num_envs()
+
+            # 保存每个环境当前的受力大小 (N, 3)
+            self._push_force_buf = torch.zeros((num_envs, 3), device=self._device, dtype=torch.float)
+            # 保存当前受力的部位ID
+            self._push_body_idx_buf = torch.zeros(num_envs, dtype=torch.long, device=self._device)
+            # 距离下次触发推力的计时器 (错开每个环境的初始触发时间)
+            self._push_timer_buf = torch.rand(num_envs, device=self._device) * self._push_interval
+            # 当前推力剩余的持续时间
+            self._push_duration_buf = torch.zeros(num_envs, device=self._device)
+        # ==================================
+
         return
+
+    def _resample_commands(self, env_ids):
+        # >>> 课程学习新增：动态指令范围 >>>
+        progress = getattr(self, '_progress', 1.0)
+
+        if progress < 0.2:
+            # 阶段 1: 只能向前走 (限制 x 为正，y 和 yaw 为 0)
+            min_x, max_x = 0.3, 1.0
+            min_y, max_y = 0.0, 0.0
+            min_yaw, max_yaw = 0.0, 0.0
+        else:
+            # 阶段 2+: 逐渐放开到全域指令
+            alpha = min(1.0, (progress - 0.2) / 0.4)
+            min_x = 0.3 + alpha * (-1.2 - 0.3)
+            max_x = 1.0 + alpha * (1.2 - 1.0)
+            min_y = 0.0 + alpha * (-0.5 - 0.0)
+            max_y = 0.0 + alpha * (0.5 - 0.0)
+            min_yaw = 0.0 + alpha * (-1.0 - 0.0)
+            max_yaw = 0.0 + alpha * (1.0 - 0.0)
+
+        self.commands[env_ids, 0] = torch.empty(len(env_ids), device=self._device).uniform_(min_x, max_x)
+        self.commands[env_ids, 1] = torch.empty(len(env_ids), device=self._device).uniform_(min_y, max_y)
+        self.commands[env_ids, 2] = torch.empty(len(env_ids), device=self._device).uniform_(min_yaw, max_yaw)
+        # <<< 课程学习新增 <<<
+        #
+        # 消除微小指令
+        self.commands[env_ids, :3] *= (torch.norm(self.commands[env_ids, :3], dim=1) > 0.1).unsqueeze(1)
+        self.command_resample_steps[env_ids] = 0
+
+    def _pre_physics_step(self, actions):
+        # 先调用父类 (sim_env.py) 的方法，完成 action 下发
+        super()._pre_physics_step(actions)
+
+        # 施加外力扰动
+        if getattr(self, "_enable_push", False):
+            self._apply_push_forces()
+
+    def _apply_push_forces(self):
+        dt = self._engine.get_timestep()
+        num_envs = self.get_num_envs()
+        env_ids_all = torch.arange(num_envs, device=self._device)
+
+        # 1. 更新时间倒计时
+        self._push_timer_buf -= dt
+        self._push_duration_buf -= dt
+
+        # 2. 找到达到间隔、需要产生新推力的环境
+        push_triggers = self._push_timer_buf <= 0
+        if push_triggers.any():
+            trigger_ids = env_ids_all[push_triggers]
+
+            # 重置触发环境的计时器和持续时间
+            self._push_timer_buf[trigger_ids] = self._push_interval
+            self._push_duration_buf[trigger_ids] = self._push_duration
+
+            # ====== 最终版：基于球坐标系的真实绳索拉力模拟 ======
+            # 1. 随机绳索拉力大小 [0, max_force]
+            forces = torch.rand(len(trigger_ids), device=self._device) * self._max_push_force
+
+            # 2. 随机水平方位角 (Azimuth Angle) [0, 2π]，决定绳子从前后左右哪个方向拉
+            azimuths = torch.rand(len(trigger_ids), device=self._device) * 2 * np.pi
+
+            # 3. 随机仰角 (Elevation Angle)。
+            # 0 代表纯水平拉扯，π/2 (90度) 代表纯垂直向上吊起。
+            # 这里设在 [0, π/2.5] (即 0~72度)，既涵盖了平拉，也包含了朋友想要的强烈"向上提拉"感
+            max_elevation = np.pi / 2.5
+            elevations = torch.rand(len(trigger_ids), device=self._device) * max_elevation
+
+            # 4. 将球坐标转换为笛卡尔坐标系的 X, Y, Z 受力分量
+            # 严格保证：1. 实际合力大小永远等于 forces；2. Z 分量绝对 >= 0 (绝不会往下压)
+            self._push_force_buf[trigger_ids, 0] = forces * torch.cos(elevations) * torch.cos(azimuths)
+            self._push_force_buf[trigger_ids, 1] = forces * torch.cos(elevations) * torch.sin(azimuths)
+            self._push_force_buf[trigger_ids, 2] = forces * torch.sin(elevations)
+            # ======================================================
+
+            # 随机选择施力部位 (head_link 还是 pelvis 等)
+            rand_idx = torch.randint(0, len(self._push_body_ids), (len(trigger_ids),), device=self._device)
+            self._push_body_idx_buf[trigger_ids] = self._push_body_ids[rand_idx]
+
+        # 3. 对处于"正在受力持续期"的环境，下发受力到物理引擎
+        active_push = self._push_duration_buf > 0
+        if active_push.any():
+            active_ids = env_ids_all[active_push]
+            forces = self._push_force_buf[active_ids]
+            body_ids = self._push_body_idx_buf[active_ids]
+            char_id = self._get_char_id()
+
+            # 批量操作：遍历配置中的部位ID，利用掩码下发，避免 Python 写 for env_id 循环造成卡顿
+            for b_idx in self._push_body_ids:
+                mask = (body_ids == b_idx)
+                if mask.any():
+                    env_subset = active_ids[mask]
+                    force_subset = forces[mask]
+                    # 这里的 set_body_forces 底层直接映射到 isaac gym 的 apply_rigid_body_force_tensors
+                    self._engine.set_body_forces(env_subset, char_id, b_idx, force_subset)
 
     def _load_motions(self, motion_file):
         self._motion_lib = motion_lib.MotionLib(motion_file=motion_file, 
@@ -117,7 +298,7 @@ class DeepMimicEnv(char_env.CharEnv):
     def _parse_joint_err_weights(self, joint_err_w):
         num_joints = self._kin_char_model.get_num_joints()
 
-        if (joint_err_w is None):
+        if (joint_err_w is None):   # <=
             self._joint_err_w = torch.ones(num_joints - 1, device=self._device, dtype=torch.float32)
         else:
             self._joint_err_w = torch.tensor(joint_err_w, device=self._device, dtype=torch.float32)
@@ -148,13 +329,180 @@ class DeepMimicEnv(char_env.CharEnv):
             col = np.array([0.5, 0.9, 0.1])
         return col
 
+    # def _reset_char(self, env_ids):
+    #     self._reset_ref_motion(env_ids)
+    #     self._ref_state_init(env_ids)
+    #
+    #     if (self._enable_ref_char()):
+    #         self._reset_ref_char(env_ids)
+    #     return
     def _reset_char(self, env_ids):
         self._reset_ref_motion(env_ids)
-        self._ref_state_init(env_ids)
+
+        num_reset = len(env_ids)
+        char_id = self._get_char_id()
+
+        # 初始化目标状态 Tensor
+        target_root_pos = torch.zeros((num_reset, 3), device=self._device)
+        target_root_rot = torch.zeros((num_reset, 4), device=self._device)
+        dof_size = self._kin_char_model.get_dof_size()
+        target_dof_pos = torch.zeros((num_reset, dof_size), device=self._device)
+
+        # >>> 课程学习新增：动态调整初始位姿分布 >>>
+        progress = getattr(self, '_progress', 1.0)
+
+        if progress < 0.6:
+            # 阶段 1 和 2: 100% 使用参考动作初始化 (最简单)
+            current_probs = [1.0, 0.0, 0.0, 0]
+        else:
+            # 阶段 3: 逐渐过渡到 YAML 里配置的高难度混合分布
+            alpha = min(1.0, (progress - 0.6) / 0.4)
+            p_ref = 1.0 + alpha * (self._hybrid_init_probs[0] - 1.0)
+            p_init = 0.0 + alpha * (self._hybrid_init_probs[1] - 0.0)
+            p_zero = 0.0 + alpha * (self._hybrid_init_probs[2] - 0.0)
+            # 兼容旧配置：如果 yaml 里给了 4 个概率，就用第 4 个(Real)，否则默认为 0
+            target_p_real = self._hybrid_init_probs[3] if len(self._hybrid_init_probs) > 3 else 0.0
+            p_real = 0.0 + alpha * (target_p_real - 0.0)
+
+            current_probs = [p_ref, p_init, p_zero, p_real]
+
+        # 2. 决定每个 env 使用哪种基础位姿
+        if self._state_init_mode == "Hybrid":
+            probs = torch.tensor(current_probs, device=self._device)
+            choices = torch.multinomial(probs, num_reset, replacement=True)
+        elif self._state_init_mode == "Init":
+            choices = torch.ones(num_reset, dtype=torch.long, device=self._device)
+        elif self._state_init_mode == "Zero":
+            choices = torch.full((num_reset,), 2, dtype=torch.long, device=self._device)
+        elif self._state_init_mode == "Real":
+            # 新增支持纯 Real 模式测试
+            choices = torch.full((num_reset,), 3, dtype=torch.long, device=self._device)
+        else:  # 默认 "Ref"
+            choices = torch.zeros(num_reset, dtype=torch.long, device=self._device)
+        # <<< 课程学习新增 <<<
+
+        # --- 基础位姿 1: 参考动作 (Ref) ---
+        ref_mask = choices == 0
+        if ref_mask.any():
+            target_root_pos[ref_mask] = self._ref_root_pos[env_ids[ref_mask]]
+            target_root_rot[ref_mask] = self._ref_root_rot[env_ids[ref_mask]]
+            target_dof_pos[ref_mask] = self._ref_dof_pos[env_ids[ref_mask]]
+
+        # --- 基础位姿 2: YAML 初始位姿 (Init) ---
+        init_mask = choices == 1
+        if init_mask.any():
+            # 广播单个 init_pose 到所有需要的 envs
+            target_root_pos[init_mask] = self._init_root_pos.unsqueeze(0).expand(init_mask.sum(), -1)
+            target_root_rot[init_mask] = self._init_root_rot.unsqueeze(0).expand(init_mask.sum(), -1)
+            target_dof_pos[init_mask] = self._init_dof_pos.unsqueeze(0).expand(init_mask.sum(), -1)
+
+        # --- 基础位姿 3: 全零位姿 (Zero) ---
+        zero_mask = choices == 2
+        if zero_mask.any():
+            # Root 的位置和姿态继承 YAML 的安全初始状态 (Init)
+            target_root_pos[zero_mask] = self._init_root_pos.unsqueeze(0).expand(zero_mask.sum(), -1)
+            target_root_rot[zero_mask] = self._init_root_rot.unsqueeze(0).expand(zero_mask.sum(), -1)
+            # 真正的 0位姿：仅仅是所有关节角归零
+            target_dof_pos[zero_mask] = 0.0
+
+        # --- 基础位姿 4: 真实的初始位姿 (Real) ---
+        real_mask = choices == 3
+        if real_mask.any():
+            target_root_pos[real_mask] = self._init_root_pos_real.unsqueeze(0).expand(real_mask.sum(), -1)
+            target_root_rot[real_mask] = self._init_root_rot_real.unsqueeze(0).expand(real_mask.sum(), -1)
+            target_dof_pos[real_mask] = self._init_dof_pos_real.unsqueeze(0).expand(real_mask.sum(), -1)
+
+        # >>> 课程学习新增：动态注入扰动噪声 >>>
+        alpha = 0.0  # <--- 提前安全初始化，彻底杜绝作用域隐患
+        # >>> 课程学习新增：动态注入扰动噪声 >>>
+        if progress < 0.6:
+            noise_pos_std, noise_rot_std, noise_dof_std = 0.0, 0.0, 0.0
+            noise_dof_vel_std = 0.0  # <--- 新增
+        else:
+            alpha = min(1.0, (progress - 0.6) / 0.4)
+            noise_pos_std = self._init_noise_std[0] * alpha
+            noise_rot_std = self._init_noise_std[1] * alpha
+            noise_dof_std = self._init_noise_std[2] * alpha
+            # <--- 新增：安全获取第 4 个参数 (dof_vel)
+            noise_dof_vel_std = self._init_noise_std[3] * alpha if len(self._init_noise_std) > 3 else 0.0
+
+        if noise_pos_std > 0:
+            pos_noise = torch.randn((num_reset, 2), device=self._device) * noise_pos_std
+            target_root_pos[:, :2] += pos_noise
+
+        if noise_rot_std > 0:
+            rot_noise_vec = torch.randn((num_reset, 3), device=self._device) * noise_rot_std
+            rot_noise_quat = torch_util.exp_map_to_quat(rot_noise_vec)
+            target_root_rot = torch_util.quat_mul(rot_noise_quat, target_root_rot)
+
+        if noise_dof_std > 0:
+            # 1. 获取物理引擎真实的 XML 限位
+            dof_low, dof_high = self._engine.get_obj_dof_limits(0, char_id)
+            dof_low_tensor = torch.tensor(dof_low, device=self._device, dtype=torch.float32)
+            dof_high_tensor = torch.tensor(dof_high, device=self._device, dtype=torch.float32)
+
+            # 2. 确定随机波动的半范围 (包含课程学习 alpha 衰减)
+            if getattr(self, "_init_noise_std_dof", None) is not None:
+                dof_noise_range = self._init_noise_std_dof * alpha
+            else:
+                dof_noise_range = noise_dof_std
+
+            # 3. 动态计算每个环境、每个关节的安全随机采样区间 [safe_low, safe_high]
+            # 原理：目标位姿往外扩 noise_range，但绝不越过 XML limit
+            safe_low = torch.maximum(target_dof_pos - dof_noise_range, dof_low_tensor)
+            safe_high = torch.minimum(target_dof_pos + dof_noise_range, dof_high_tensor)
+
+            # 4. 在安全区间内做标准均匀分布采样: value = low + rand(0,1) * (high - low)
+            target_dof_pos = safe_low + torch.rand((num_reset, dof_size), device=self._device) * (safe_high - safe_low)
+        # <<< 结束修改 <<<
+
+        # ====== 新增修复：将屏蔽的关节强制重置为初始安全角度，剥夺其噪声干扰 ======
+        if getattr(self, "_enable_joint_mask", False) and len(self._masked_dof_indices) > 0:
+            target_dof_pos[:, self._masked_dof_indices] = self._init_dof_pos[self._masked_dof_indices]
+        # =========================================================================
+
+        # 4. 下发给底层物理引擎 (速度强制设为 0，因为只是初始态)
+        # >>> 新增局部：如果是焊死在空中的台架模式，绝对不能给根节点下发状态！ <<<
+        if not getattr(self, "_fix_root", False):
+            self._engine.set_root_pos(env_ids, char_id, target_root_pos)
+            self._engine.set_root_rot(env_ids, char_id, target_root_rot)
+            # self._engine.set_root_vel(env_ids, char_id, 0.0)
+            # self._engine.set_root_ang_vel(env_ids, char_id, 0.0)
+
+        self._engine.set_dof_pos(env_ids, char_id, target_dof_pos)
+        # <--- 新增：应用关节速度噪声
+        if noise_dof_vel_std > 0:
+            dof_vel_noise = torch.randn((num_reset, dof_size), device=self._device) * noise_dof_vel_std
+
+            # ====== 新增修复：屏蔽关节的速度强制为 0 ======
+            if getattr(self, "_enable_joint_mask", False) and len(self._masked_dof_indices) > 0:
+                dof_vel_noise[:, self._masked_dof_indices] = 0.0
+            # ==============================================
+
+            self._engine.set_dof_vel(env_ids, char_id, dof_vel_noise)
+            # >>> 新增保护 <<<
+            if not getattr(self, "_fix_root", False):
+                root_vel_noise = torch.randn((num_reset, 3), device=self._device) * 0.005
+                root_ang_vel_noise = torch.randn((num_reset, 3), device=self._device) * 0.005
+                self._engine.set_root_vel(env_ids, char_id, root_vel_noise)
+                self._engine.set_root_ang_vel(env_ids, char_id, root_ang_vel_noise)
+        else:
+            self._engine.set_dof_vel(env_ids, char_id, 0.0)
+            # >>> 新增保护 <<<
+            if not getattr(self, "_fix_root", False):
+                self._engine.set_root_vel(env_ids, char_id, 0.0)
+                self._engine.set_root_ang_vel(env_ids, char_id, 0.0)
+
+        # >>> 修改局部：保护 set_body_vel 和 set_body_ang_vel <<<
+        if not getattr(self, "_fix_root", False):
+            self._engine.set_body_vel(env_ids, char_id, 0.0)
+            self._engine.set_body_ang_vel(env_ids, char_id, 0.0)
 
         if (self._enable_ref_char()):
             self._reset_ref_char(env_ids)
         return
+
+
 
     def _reset_ref_char(self, env_ids):
         ref_char_id = self._get_ref_char_id()
@@ -227,8 +575,85 @@ class DeepMimicEnv(char_env.CharEnv):
 
         if (self._enable_ref_char()):
             self._update_ref_char()
+
+        self.command_resample_steps += 1
+        resample_ids = (self.command_resample_steps >= 200).nonzero(as_tuple=False).flatten()
+        if len(resample_ids) > 0:
+            self._resample_commands(resample_ids)
+        # ====== 新增：调用外力可视化 ======
+        if self._visualize and getattr(self, "_enable_push", False):
+            self._draw_push_forces()
+        # ==================================
         return
-    
+
+    def _draw_push_forces(self):
+        # 1. 别在这里手动调 clear_lines，底层 render() 结束后会自动清理！
+        active_push = self._push_duration_buf > 0
+        if not active_push.any():
+            return
+
+        active_ids = torch.nonzero(active_push, as_tuple=False).flatten()
+        forces = self._push_force_buf[active_ids].cpu().numpy()
+        body_idxs = self._push_body_idx_buf[active_ids]
+        char_id = self._get_char_id()
+
+        max_render_envs = min(len(active_ids), 4)
+
+        verts_list = []
+        cols_list = []
+
+        for i in range(max_render_envs):
+            env_id = active_ids[i].item()
+            b_idx = body_idxs[i].item()
+            f_np = forces[i]
+
+            # 这是绝对的世界坐标 (World Coordinates)
+            body_pos = self._engine.get_body_pos(char_id)[env_id, b_idx].cpu().numpy()
+
+            force_scale = 1.0 / 150.0
+            start_pos = body_pos
+            end_pos = start_pos + f_np * force_scale
+
+            # [主线] 红色受力线
+            verts_list.append([start_pos[0], start_pos[1], start_pos[2], end_pos[0], end_pos[1], end_pos[2]])
+            cols_list.append([1.0, 0.0, 0.0])  # 红色
+
+            # [锚记] 在受力源头画一个黄色三维十字，防止单根红线在特定视角下看不清
+            s = 0.05
+            verts_list.append(
+                [start_pos[0] - s, start_pos[1], start_pos[2], start_pos[0] + s, start_pos[1], start_pos[2]])
+            cols_list.append([1.0, 1.0, 0.0])  # 黄色
+            verts_list.append(
+                [start_pos[0], start_pos[1] - s, start_pos[2], start_pos[0], start_pos[1] + s, start_pos[2]])
+            cols_list.append([1.0, 1.0, 0.0])
+            verts_list.append(
+                [start_pos[0], start_pos[1], start_pos[2] - s, start_pos[0], start_pos[1], start_pos[2] + s])
+            cols_list.append([1.0, 1.0, 0.0])
+
+        if len(verts_list) > 0:
+            verts_np = np.array(verts_list, dtype=np.float32)
+            cols_np = np.array(cols_list, dtype=np.float32)
+
+            # 【终极修复】：第二个参数必须传 None！强行告诉引擎使用绝对世界坐标系！
+            # 绝不能用 self._engine.draw_lines 传 env_id 进去。
+            self._engine._gym.add_lines(self._engine._viewer, None, len(verts_list), verts_np, cols_np)
+
+    def _reset_envs(self, env_ids):
+        super()._reset_envs(env_ids)
+
+        if (len(env_ids) > 0):
+            self._resample_commands(env_ids)
+            # ====== 新增：清空 Reset 环境的外力状态 ======
+            if getattr(self, "_enable_push", False):
+                # 给一个随机的初始倒计时，避免所有复活的环境在同一帧被拉拽
+                self._push_timer_buf[env_ids] = torch.rand(len(env_ids), device=self._device) * self._push_interval
+                # 持续时间设为0，立刻停止受力
+                self._push_duration_buf[env_ids] = 0.0
+            # =============================================
+        return
+
+
+
     def _update_ref_motion(self):
         motion_ids = self._motion_ids
         motion_times = self._get_motion_times()
@@ -277,7 +702,7 @@ class DeepMimicEnv(char_env.CharEnv):
     def _sample_motion_times(self, n):
         motion_ids = self._motion_lib.sample_motions(n)
 
-        if (self._rand_reset):
+        if (self._rand_reset):      # <=
             motion_times = self._motion_lib.sample_time(motion_ids)
         else:
             motion_times = torch.zeros(n, dtype=torch.float, device=self._device)
@@ -287,7 +712,7 @@ class DeepMimicEnv(char_env.CharEnv):
     def _build_data_buffers(self):
         super()._build_data_buffers()
 
-        if (self._log_tracking_error):
+        if (self._log_tracking_error):  # False
             num_track_errors = 7
             self._error_tracker = stats_tracker.StatsTracker(num_track_errors, device=self._device)
         return
@@ -304,9 +729,10 @@ class DeepMimicEnv(char_env.CharEnv):
     def _build_env(self, env_id, config):
         super()._build_env(env_id, config)
 
-        if (self._enable_ref_char()):
+        if (self._enable_ref_char()):   # False
             ref_char_col = self._get_ref_char_color()
             ref_char_id = self._build_ref_character(env_id, config, color=ref_char_col)
+            self._ref_char_ids.append(ref_char_id)
             
             if (env_id == 0):
                 self._ref_char_ids.append(ref_char_id)
@@ -324,6 +750,7 @@ class DeepMimicEnv(char_env.CharEnv):
                                           is_visual=True,
                                           enable_self_collisions=False,
                                           disable_motors=True,
+                                          fix_root=self._fix_root,
                                           color=color)
         return char_id
 
@@ -350,15 +777,25 @@ class DeepMimicEnv(char_env.CharEnv):
             body_pos = body_pos[env_ids]
 
             motion_ids = motion_ids[env_ids]
-            
+
+        # >>> 新增：如果你开启了 fix_root，强行屏蔽躯干姿态和速度，逼迫策略只看关节 <<<
+        if getattr(self, "_fix_root", False):
+            # 将四元数强制设为标准无旋转状态 (x,y,z,w) = (0,0,0,1)
+            root_rot = torch.zeros_like(root_rot)
+            root_rot[..., 3] = 1.0
+            # 屏蔽线速度和角速度
+            root_vel = torch.zeros_like(root_vel)
+            root_ang_vel = torch.zeros_like(root_ang_vel)
+        # <<< 结束新增 <<<
+
         joint_rot = self._kin_char_model.dof_to_rot(dof_pos)
         
         if (self._enable_phase_obs):
             motion_phase = self._motion_lib.calc_motion_phase(motion_ids, motion_times)
-        else:
+        else:                   # <=
             motion_phase = torch.zeros([0], device=self._device)
 
-        if (self._has_key_bodies()):
+        if (self._has_key_bodies()):    # <=
             key_pos = body_pos[..., self._key_body_ids, :]
         else:
             key_pos = torch.zeros([0], device=self._device)
@@ -380,18 +817,48 @@ class DeepMimicEnv(char_env.CharEnv):
                 tar_key_pos = tar_body_pos[..., self._key_body_ids, :]
             else:
                 tar_key_pos = torch.zeros([0], device=self._device)
-        else:
+        else:                           # <=
             tar_root_pos = torch.zeros([0], device=self._device)
             tar_root_rot = tar_root_pos
             tar_joint_rot = tar_root_pos
             tar_key_pos = tar_root_pos
 
-        obs = compute_deepmimic_obs(root_pos=root_pos, 
+        if getattr(self, "use_commands", False) and hasattr(self, "commands"):
+            commands = self.commands if env_ids is None else self.commands[env_ids]
+        else:
+            commands = torch.tensor([])
+        # 此时已经拿到了 JIT 函数返回的纯净 tensor，且处于类方法中，可以安全使用 self
+        if getattr(self, "_enable_push", False):
+            # 只要 duration > 0，就认为是 1.0，否则是 0.0
+            # 维度扩展为 [num_envs, 1]
+            is_pushed_bool = (self._push_duration_buf > 0).float().unsqueeze(-1)
+            # ====== 新增：修复维度炸裂的 BUG ======
+            if env_ids is not None:
+                is_pushed_bool = is_pushed_bool[env_ids]
+            # ======================================
+        else:
+            is_pushed_bool = torch.tensor([])
+
+        # ====== 新增：切除被屏蔽的关节数据 (包含 target 数据) ======
+        if getattr(self, "_enable_joint_mask", False) and len(self._masked_dof_indices) > 0:
+            joint_rot_in = joint_rot[..., self._unmasked_joint_rot_indices, :]
+            dof_vel_in = dof_vel[..., self._unmasked_dof_indices]
+            if self._enable_tar_obs:
+                tar_joint_rot_in = tar_joint_rot[..., self._unmasked_joint_rot_indices, :]
+            else:
+                tar_joint_rot_in = tar_joint_rot
+        else:
+            joint_rot_in = joint_rot
+            dof_vel_in = dof_vel
+            tar_joint_rot_in = tar_joint_rot
+        # ========================================================
+
+        actor_obs, critic_obs, prop_obs, priv_obs = compute_deepmimic_obs(root_pos=root_pos,
                                     root_rot=root_rot, 
                                     root_vel=root_vel, 
                                     root_ang_vel=root_ang_vel,
-                                    joint_rot=joint_rot,
-                                    dof_vel=dof_vel,
+                                    joint_rot=joint_rot_in,  # 修改此处
+                                    dof_vel=dof_vel_in,  # 修改此处
                                     key_pos=key_pos,
                                     global_obs=self._global_obs,
                                     root_height_obs=self._root_height_obs,
@@ -402,8 +869,92 @@ class DeepMimicEnv(char_env.CharEnv):
                                     tar_root_pos=tar_root_pos,
                                     tar_root_rot=tar_root_rot,
                                     tar_joint_rot=tar_joint_rot,
-                                    tar_key_pos=tar_key_pos)
-        return obs
+                                    tar_key_pos=tar_key_pos,
+                                    cmds=commands,
+                                    push=is_pushed_bool,
+                                    asymmetric_obs=self._asymmetric_obs
+                                                      )
+
+            # # 将外力 Bool 强行塞入 特权观测(priv_obs) 和 评价网络观测(critic_obs)
+            # priv_obs = torch.cat([priv_obs, is_pushed_bool], dim=-1)
+            # critic_obs = torch.cat([critic_obs, is_pushed_bool], dim=-1)
+        # ====== 关键修复：在这里全局注入持续的观测传感器噪声 ======
+        if getattr(self, "obs_noise", False) and self._mode == base_env.EnvMode.TRAIN:
+            # 采用 0.005 作为折中方案，避免 0.02 导致实机关节高频抖动
+            prop_obs += torch.randn_like(prop_obs) * 0.005
+        # ==================================================
+        # 保存 Critic 观测，机制同上
+        if not hasattr(self, '_critic_obs_buf'):
+            self._critic_obs_buf = torch.zeros([self.get_num_envs(), critic_obs.shape[-1]], device=self._device)
+
+        if env_ids is None:
+            self._critic_obs_buf[:] = critic_obs
+        else:
+            self._critic_obs_buf[env_ids] = critic_obs
+
+        # === 新增：暴露给 Agent ===
+        if hasattr(self, '_info'):
+            self._info["critic_obs"] = self._critic_obs_buf
+
+        # ==========================================================
+        # 【核心新增】：把物理引擎真实的 dof_pos 放进 info 字典，安全传递给 PPO！
+        # 这里必须放缩减后的 dof_pos，否则 ppo_agent 计算 loss 维度不匹配！
+        if getattr(self, "_enable_joint_mask", False) and len(self._masked_dof_indices) > 0:
+            dof_pos_out = dof_pos[:, self._unmasked_dof_indices]
+        else:
+            dof_pos_out = dof_pos
+
+        if not hasattr(self, '_dof_pos_buf'):
+            self._dof_pos_buf = torch.zeros_like(dof_pos_out)
+        if env_ids is None:
+            self._dof_pos_buf[:] = dof_pos_out
+        else:
+            self._dof_pos_buf[env_ids] = dof_pos_out
+        self._info["dof_pos"] = self._dof_pos_buf.clone()
+        # ==========================================================
+
+        # # 4. ====== RMA / SE 核心组装 ======
+        # if self._enable_rma or self._enable_se:  # <--- 修改这里
+        #     if self._prop_hist_buf is None:
+        #         # 动态初始化，此时我们明确知道了 prop_obs 的精确维度
+        #         self.prop_dim = prop_obs.shape[-1]
+        #         self.priv_dim = priv_obs.shape[-1]
+        #         self.hist_dim = self.prop_dim * self._rma_hist_len
+        #         import util.circular_buffer as circular_buffer
+        #         self._prop_hist_buf = circular_buffer.CircularBuffer(
+        #             batch_size=self.get_num_envs(),
+        #             buffer_len=self._rma_hist_len,
+        #             shape=[self.prop_dim],
+        #             dtype=prop_obs.dtype,
+        #             device=self._device
+        #         )
+        #         # ====== 修复：直接用已经带噪的 prop_obs 填满历史 ======
+        #         self._prop_hist_buf.fill(torch.arange(self.get_num_envs()),
+        #                                  prop_obs.unsqueeze(1).repeat(1, self._rma_hist_len, 1))
+        #
+        #     # 推入最新帧
+        #     if env_ids is None:
+        #         self._prop_hist_buf.push(prop_obs)
+        #     else:
+        #         # # 【修改这里】：用当前的初始本体感知状态，填满被 reset 环境的整个历史窗口
+        #         # # prop_obs[env_ids] 的维度是 [len(env_ids), prop_dim]
+        #         # # unsqueeze 和 repeat 后变成 [len(env_ids), 30, prop_dim]，完美适配 fill 接口
+        #         fill_data = prop_obs.unsqueeze(1).repeat(1, self._rma_hist_len, 1)
+        #         self._prop_hist_buf.fill(env_ids, fill_data)
+        #         # pass
+        #
+        #
+        #         # 取出展平的历史 [N, T, prop_dim] -> [N, T*prop_dim]
+        #     hist_obs = self._prop_hist_buf.get_all().reshape(self.get_num_envs(), -1)
+        #     if env_ids is not None:
+        #         hist_obs = hist_obs[env_ids]
+        #
+        #     # 强行重构 Actor Obs：[本体感知, 特权信息, 历史帧]
+        #     rma_actor_obs = torch.cat([prop_obs, priv_obs, hist_obs], dim=-1)
+        #     return rma_actor_obs
+
+        # 如果不开 RMA，完美回退到原来的 actor_obs
+        return actor_obs
     
     def _update_reward(self):
         char_id = self._get_char_id()
@@ -425,7 +976,11 @@ class DeepMimicEnv(char_env.CharEnv):
 
         track_root_h = self._root_height_obs
         track_root = self._track_global_root()
-        
+
+        # 安全获取 commands，防止非控制环境报错
+        cmds = self.commands if hasattr(self, "commands") else torch.zeros((self.get_num_envs(), 3),
+                                                                           device=self._device)
+
         self._reward_buf[:] = compute_reward(root_pos=root_pos,
                                              root_rot=root_rot,
                                              root_vel=root_vel,
@@ -457,7 +1012,10 @@ class DeepMimicEnv(char_env.CharEnv):
                                              vel_scale=self._reward_vel_scale,
                                              root_pose_scale=self._reward_root_pose_scale,
                                              root_vel_scale=self._reward_root_vel_scale,
-                                             key_pos_scale=self._reward_key_pos_scale)
+                                             key_pos_scale=self._reward_key_pos_scale,
+
+                                             cmds=cmds
+                                             )
         return
 
     def _update_done(self):
@@ -494,9 +1052,10 @@ class DeepMimicEnv(char_env.CharEnv):
 
     def _update_info(self, env_ids=None):
         super()._update_info(env_ids)
-        
-        if (self._log_tracking_error and self._mode == base_env.EnvMode.TEST):
-            self._record_tracking_error(env_ids)
+
+        if (self._mode == base_env.EnvMode.TEST):
+            if (self._log_tracking_error):      # ×
+                self._record_tracking_error(env_ids)
         return
     
     def _record_tracking_error(self, env_ids=None):
@@ -558,6 +1117,14 @@ class DeepMimicEnv(char_env.CharEnv):
 
             self._error_tracker.update(tracking_error)
 
+            err_stats = self._error_tracker.get_mean()
+            self._diagnostics["root_pos_err"] = err_stats[0]
+            self._diagnostics["root_rot_err"] = err_stats[1]
+            self._diagnostics["body_pos_err"] = err_stats[2]
+            self._diagnostics["body_rot_err"] = err_stats[3]
+            self._diagnostics["dof_vel_err"] = err_stats[4]
+            self._diagnostics["root_vel_err"] = err_stats[5]
+            self._diagnostics["root_ang_vel_err"] = err_stats[6]
         return
     
     def _fetch_tar_obs_data(self, motion_ids, motion_times):
@@ -679,9 +1246,11 @@ def compute_tar_obs(ref_root_pos, ref_root_rot, root_pos, root_rot, joint_rot, k
 @torch.jit.script
 def compute_deepmimic_obs(root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel, key_pos, global_obs, root_height_obs, 
                           phase, num_phase_encoding, enable_phase_obs, 
-                          enable_tar_obs, tar_root_pos, tar_root_rot, tar_joint_rot, tar_key_pos):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, bool, Tensor, int, bool, bool, Tensor, Tensor, Tensor, Tensor) -> Tensor
-    char_obs = char_env.compute_char_obs(root_pos=root_pos,
+                          enable_tar_obs, tar_root_pos, tar_root_rot, tar_joint_rot, tar_key_pos,
+                          cmds, push,
+                          asymmetric_obs):
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, bool, Tensor, int, bool, bool, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool) -> Tuple[Tensor, Tensor, Tensor, Tensor]
+    actor_char_obs, critic_char_obs, prop_obs, priv_obs = char_env.compute_char_obs(root_pos=root_pos,
                                             root_rot=root_rot,
                                             root_vel=root_vel,
                                             root_ang_vel=root_ang_vel,
@@ -689,14 +1258,20 @@ def compute_deepmimic_obs(root_pos, root_rot, root_vel, root_ang_vel, joint_rot,
                                             dof_vel=dof_vel,
                                             key_pos=key_pos,
                                             global_obs=global_obs,
-                                            root_height_obs=root_height_obs)
-    obs = [char_obs]
+                                            root_height_obs=root_height_obs,
+                                            cmds=cmds,
+                                            push=push,
+                                            asymmetric_obs=asymmetric_obs
+                                         )
+    actor_obs_list = [actor_char_obs]
+    critic_obs_list = [critic_char_obs]
 
-    if (enable_phase_obs):
+    if (enable_phase_obs):  # False
         phase_obs = compute_phase_obs(phase=phase, num_phase_encoding=num_phase_encoding)
-        obs.append(phase_obs)
+        actor_obs_list.append(phase_obs)
+        critic_obs_list.append(phase_obs)
 
-    if (enable_tar_obs):
+    if (enable_tar_obs):    # False
         if (global_obs):
             ref_root_pos = root_pos
             ref_root_rot = root_rot
@@ -714,11 +1289,14 @@ def compute_deepmimic_obs(root_pos, root_rot, root_vel, root_ang_vel, joint_rot,
                                   root_height_obs=root_height_obs)
         
         tar_obs = torch.reshape(tar_obs, [tar_obs.shape[0], tar_obs.shape[1] * tar_obs.shape[2]])
-        obs.append(tar_obs)
+        # 目标(target)观测通常两端都需要
+        actor_obs_list.append(tar_obs)
+        critic_obs_list.append(tar_obs)
 
-    obs = torch.cat(obs, dim=-1)
-    
-    return obs
+    actor_obs = torch.cat(actor_obs_list, dim=-1)
+    critic_obs = torch.cat(critic_obs_list, dim=-1)
+
+    return actor_obs, critic_obs, prop_obs, priv_obs
 
 @torch.jit.script
 def compute_done(done_buf, time, ep_len, root_rot, body_pos, tar_root_rot, tar_body_pos, 
@@ -789,8 +1367,9 @@ def compute_reward(root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_ve
                    tar_joint_rot, tar_dof_vel, tar_key_pos,
                    joint_rot_err_w, dof_err_w, track_root_h, track_root,
                    pose_w, vel_w, root_pose_w, root_vel_w, key_pos_w,
-                   pose_scale, vel_scale, root_pose_scale, root_vel_scale, key_pos_scale):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, bool, float, float, float, float, float, float, float, float, float, float) -> Tensor
+                   pose_scale, vel_scale, root_pose_scale, root_vel_scale, key_pos_scale,
+                   cmds):
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, bool, float, float, float, float, float, float, float, float, float, float, Tensor) -> Tensor
     pose_diff = torch_util.quat_diff_angle(joint_rot, tar_joint_rot)
     pose_err = torch.sum(joint_rot_err_w * pose_diff * pose_diff, dim=-1)
 

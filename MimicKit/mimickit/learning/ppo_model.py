@@ -11,7 +11,7 @@ class PPOModel(base_model.BaseModel):
         self._build_nets(config, env)
         return
 
-    def eval_actor(self, obs):
+    def eval_actor(self, obs, use_hist=False):
         h = self._actor_layers(obs)
         a_dist = self._action_dist(h)
         return a_dist
@@ -59,6 +59,10 @@ class PPOModel(base_model.BaseModel):
         return input_dict
     
     def _build_critic_input_dict(self, env):
-        obs_space = env.get_obs_space()
+        # === 修改：如果有专门的 critic_obs_space，就用它 ===
+        if hasattr(env, "get_critic_obs_space"):
+            obs_space = env.get_critic_obs_space()
+        else:
+            obs_space = env.get_obs_space()
         input_dict = {"obs": obs_space}
         return input_dict

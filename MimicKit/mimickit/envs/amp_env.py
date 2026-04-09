@@ -8,8 +8,7 @@ import util.torch_util as torch_util
 
 class AMPEnv(deepmimic_env.DeepMimicEnv):
     def __init__(self, env_config, engine_config, num_envs, device, visualize, record_video=False):
-        self._num_disc_obs_steps = env_config["num_disc_obs_steps"]
-
+        self._num_disc_obs_steps = env_config["num_disc_obs_steps"] # 10
         super().__init__(env_config=env_config, engine_config=engine_config, num_envs=num_envs, device=device,
                          visualize=visualize, record_video=record_video)
         return
@@ -38,23 +37,42 @@ class AMPEnv(deepmimic_env.DeepMimicEnv):
             ref_root_pos = torch.zeros_like(root_pos[..., -1, :])
             ref_root_rot = torch.zeros_like(root_rot[..., -1, :])
             ref_root_rot[..., -1] = 1
-        else:
+        else:                           # <=
             ref_root_pos = root_pos[..., -1, :]
             ref_root_rot = root_rot[..., -1, :]
-            
-        if (self._has_key_bodies()):
+
+        # >>> 新增：强行抹平 Demo 侧喂给判别器的躯干状态，保证和 Sim 侧公平对齐 <<<
+        if getattr(self, "_fix_root", False):
+            root_rot = torch.zeros_like(root_rot)
+            root_rot[..., -1] = 1.0
+            root_vel = torch.zeros_like(root_vel)
+            root_ang_vel = torch.zeros_like(root_ang_vel)
+            ref_root_rot = torch.zeros_like(ref_root_rot)
+            ref_root_rot[..., -1] = 1.0
+        # <<< 结束新增 <<<
+
+        if (self._has_key_bodies()):    # <=
             key_pos = body_pos[..., self._key_body_ids, :]
         else:
             key_pos = torch.zeros([0], device=self._device)
-        
+
+        # ====== 新增：切除被屏蔽的关节数据 ======
+        if getattr(self, "_enable_joint_mask", False) and len(self._masked_dof_indices) > 0:
+            joint_rot_in = joint_rot[..., self._unmasked_joint_rot_indices, :]
+            dof_vel_in = dof_vel[..., self._unmasked_dof_indices]
+        else:
+            joint_rot_in = joint_rot
+            dof_vel_in = dof_vel
+        # =====================================
+
         disc_obs = compute_disc_obs(ref_root_pos=ref_root_pos,
                                   ref_root_rot=ref_root_rot,
                                   root_pos=root_pos,
                                   root_rot=root_rot, 
                                   root_vel=root_vel,
                                   root_ang_vel=root_ang_vel,
-                                  joint_rot=joint_rot,
-                                  dof_vel=dof_vel,
+                                  joint_rot=joint_rot_in,  # 修改此处
+                                  dof_vel=dof_vel_in,  # 修改此处
                                   key_pos=key_pos,
                                   global_obs=self._global_obs,
                                   root_height_obs=self._root_height_obs)
@@ -213,14 +231,33 @@ class AMPEnv(deepmimic_env.DeepMimicEnv):
             ref_root_pos = torch.zeros_like(root_pos[..., -1, :])
             ref_root_rot = torch.zeros_like(root_rot[..., -1, :])
             ref_root_rot[..., -1] = 1
-        else:
+        else:       # <=
             ref_root_pos = root_pos[..., -1, :]
             ref_root_rot = root_rot[..., -1, :]
-            
-        if (self._has_key_bodies()):
+
+        # >>> 新增：强行抹平 Sim 侧喂给判别器的躯干状态 <<<
+        if getattr(self, "_fix_root", False):
+            root_rot = torch.zeros_like(root_rot)
+            root_rot[..., -1] = 1.0  # 最后一维是 w
+            root_vel = torch.zeros_like(root_vel)
+            root_ang_vel = torch.zeros_like(root_ang_vel)
+            ref_root_rot = torch.zeros_like(ref_root_rot)
+            ref_root_rot[..., -1] = 1.0
+        # <<< 结束新增 <<<
+
+        if (self._has_key_bodies()):    # <=
             key_pos = body_pos[..., self._key_body_ids, :]
         else:
             key_pos = torch.zeros([0], device=self._device)
+
+        # ====== 新增：切除被屏蔽的关节数据 ======
+        if getattr(self, "_enable_joint_mask", False) and len(self._masked_dof_indices) > 0:
+            joint_rot_in = joint_rot[..., self._unmasked_joint_rot_indices, :]
+            dof_vel_in = dof_vel[..., self._unmasked_dof_indices]
+        else:
+            joint_rot_in = joint_rot
+            dof_vel_in = dof_vel
+        # =====================================
 
         disc_obs = compute_disc_obs(ref_root_pos=ref_root_pos,
                                   ref_root_rot=ref_root_rot,
@@ -228,8 +265,8 @@ class AMPEnv(deepmimic_env.DeepMimicEnv):
                                   root_rot=root_rot, 
                                   root_vel=root_vel,
                                   root_ang_vel=root_ang_vel,
-                                  joint_rot=joint_rot,
-                                  dof_vel=dof_vel,
+                                  joint_rot=joint_rot_in,  # 修改此处
+                                  dof_vel=dof_vel_in,  # 修改此处
                                   key_pos=key_pos,
                                   global_obs=self._global_obs,
                                   root_height_obs=self._root_height_obs)
@@ -273,6 +310,19 @@ class AMPEnv(deepmimic_env.DeepMimicEnv):
         return
 
     def _update_reward(self):
+        char_id = self._get_char_id()
+        root_rot = self._engine.get_root_rot(char_id)
+        root_vel = self._engine.get_root_vel(char_id)
+        root_ang_vel = self._engine.get_root_ang_vel(char_id)
+
+        # 安全获取 commands，防止非控制环境报错
+        cmds = self.commands if hasattr(self, "commands") else torch.zeros((self.get_num_envs(), 3),
+                                                                           device=self._device)
+
+        self._reward_buf[:] = compute_reward(root_rot=root_rot,
+                                             root_vel=root_vel,
+                                             root_ang_vel=root_ang_vel,
+                                             cmds=cmds)
         return
     
     def _reset_envs(self, env_ids):
@@ -296,7 +346,7 @@ class AMPEnv(deepmimic_env.DeepMimicEnv):
         self._disc_hist_body_pos.fill(env_ids, body_pos)
         return
 
-    
+
 @torch.jit.script
 def compute_disc_vel_obs(ref_root_rot, root_vel, root_ang_vel, dof_vel, global_obs):
     # type: (Tensor, Tensor, Tensor, Tensor, bool) -> Tensor
@@ -347,3 +397,41 @@ def compute_disc_obs(ref_root_pos, ref_root_rot, root_pos, root_rot, root_vel, r
     disc_obs = torch.reshape(disc_obs, [disc_obs.shape[0], -1])
 
     return disc_obs
+
+
+@torch.jit.script
+def compute_reward(root_rot, root_vel, root_ang_vel, cmds):
+    # type: (Tensor, Tensor, Tensor, Tensor) -> Tensor
+
+    # 1. 计算机器人当前的局部坐标系速度
+    heading_inv_rot = torch_util.calc_heading_quat_inv(root_rot)
+    local_root_vel = torch_util.quat_rotate(heading_inv_rot, root_vel)
+    local_root_ang_vel = torch_util.quat_rotate(heading_inv_rot, root_ang_vel)
+
+    # # 2. 计算与指令的误差
+    # lin_vel_err = torch.sum(torch.square(cmds[:, :2] - local_root_vel[:, :2]), dim=1)
+    # ang_vel_err = torch.square(cmds[:, 2] - local_root_ang_vel[:, 2])
+    #
+    # # 3. 指数映射为奖励值 (平滑追踪)
+    # tracking_r = torch.exp(-lin_vel_err - 0.5 * ang_vel_err)
+    #
+    # return tracking_r
+
+    # 2. 完全对齐 IG：提取局部 XY 线速度 和 Yaw 角速度
+    root_local_xy_speed = local_root_vel[:, :2]
+    root_local_yaw_speed = local_root_ang_vel[:, 2]
+
+    # 3. 计算线速度奖励 (speed_xy)
+    # 注意：IG中代码是 torch.sum(cmds - root_local_xy_speed, dim=1)**2.0
+    # 这里我们严格保持一致
+    lin_vel_error = torch.sum(cmds[:, :2] - root_local_xy_speed, dim=1)
+    speed_xy = torch.exp(-lin_vel_error ** 2.0)
+
+    # 4. 计算角速度奖励 (speed_yaw)
+    ang_vel_error = cmds[:, 2] - root_local_yaw_speed
+    speed_yaw = torch.exp(-ang_vel_error ** 2.0)
+
+    # 5. 相加返回 (IG 中乘以了 task_speed_mul，我们可以在 agent 的 task_reward_weight 里控制总比例)
+    reward = speed_xy + speed_yaw
+    return reward
+

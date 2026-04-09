@@ -48,7 +48,7 @@ def build_env(env_file, engine_file, num_envs, device, visualize, record_video=F
 
 def load_config(file):
     if (file is not None and file != ""):
-        with open(file, "r") as stream:
+        with open(file, "r", encoding="utf-8") as stream:
             config = yaml.safe_load(stream)
     else:
         config = None

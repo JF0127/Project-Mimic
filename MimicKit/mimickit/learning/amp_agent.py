@@ -3,7 +3,6 @@ import torch
 
 import learning.amp_model as amp_model
 import learning.experience_buffer as experience_buffer
-import learning.mp_optimizer as mp_optimizer
 import learning.normalizer as normalizer
 import learning.ppo_agent as ppo_agent
 import util.torch_util as torch_util
@@ -16,11 +15,12 @@ class AMPAgent(ppo_agent.PPOAgent):
     def _load_params(self, config):
         super()._load_params(config)
         
-        self._disc_epochs = config["disc_epochs"]
-        self._disc_batch_size = config["disc_batch_size"]
         self._disc_replay_samples = config["disc_replay_samples"]
+        self._disc_batch_size = config["disc_batch_size"]
+        self._disc_loss_weight = config["disc_loss_weight"]
         self._disc_logit_reg = config["disc_logit_reg"]
         self._disc_grad_penalty = config["disc_grad_penalty"]
+        self._disc_weight_decay = config["disc_weight_decay"]
         self._disc_reward_scale = config["disc_reward_scale"]
         self._disc_eval_batch_size = int(config.get("disc_eval_batch_size", 0))
 
@@ -32,21 +32,7 @@ class AMPAgent(ppo_agent.PPOAgent):
         model_config = config["model"]
         self._model = amp_model.AMPModel(model_config, self._env)
         return
-    
-    def _build_optimizer(self, config):
-        super()._build_optimizer(config)
 
-        disc_config = config["disc_optimizer"]
-        disc_params = list(self._model.get_disc_params())
-        disc_params = [p for p in disc_params if p.requires_grad]
-        self._disc_optimizer = mp_optimizer.MPOptimizer(disc_config, disc_params)
-        return
-    
-    def _sync_optimizer(self):
-        super()._sync_optimizer()
-        self._disc_optimizer.sync()
-        return
-    
     def _build_exp_buffer(self, config):
         super()._build_exp_buffer(config)
 
@@ -80,10 +66,8 @@ class AMPAgent(ppo_agent.PPOAgent):
 
     def _build_train_data(self):
         self._record_disc_demo_data()
-        self._store_disc_replay_data()
-
         reward_info = self._compute_rewards()
-
+        
         info = super()._build_train_data()
         info = {**info, **reward_info}
         return info
@@ -95,11 +79,11 @@ class AMPAgent(ppo_agent.PPOAgent):
         disc_obs_demo = self._env.fetch_disc_obs_demo(n)
         self._exp_buffer.set_data_flat("disc_obs_demo", disc_obs_demo)
         self._disc_obs_norm.record(disc_obs_demo)
+        
+        self._store_disc_replay_data(disc_obs)
         return
 
-    def _store_disc_replay_data(self):
-        disc_obs = self._exp_buffer.get_data_flat("disc_obs")
-
+    def _store_disc_replay_data(self, disc_obs):
         n = disc_obs.shape[0]
         rand_idx = torch.randperm(n, device=self._device, dtype=torch.long)
         
@@ -121,7 +105,31 @@ class AMPAgent(ppo_agent.PPOAgent):
         norm_disc_obs = self._disc_obs_norm.normalize(disc_obs)
         disc_r = self._calc_disc_rewards(norm_disc_obs)
 
-        r = self._task_reward_weight * task_r + self._disc_reward_weight * disc_r
+        if getattr(self, "dynamics_weight", False):
+            # >>> 课程学习新增：动态调整奖励权重 >>>
+            progress = self._sample_count / max(1, getattr(self, '_max_samples', 1))
+            progress = np.clip(progress, 0.0, 1.0)
+
+            if progress < 0.2:
+                # 阶段 1: 强迫模仿 (Task: 0.2, Disc: 0.8)
+                w_task, w_disc = 0.2, 0.8
+            elif progress < 0.6:
+                # 阶段 2: 线性过渡到目标权重
+                alpha = (progress - 0.2) / 0.4
+                w_task = 0.2 + alpha * (self._task_reward_weight - 0.2)
+                w_disc = 0.8 + alpha * (self._disc_reward_weight - 0.8)
+            else:
+                # 阶段 3: 保持目标权重
+                w_task, w_disc = self._task_reward_weight, self._disc_reward_weight
+
+            # 记录到 logger 方便你观察曲线
+            self._logger.log("Curriculum_W_Task", w_task, collection="1_Info")
+            self._logger.log("Curriculum_W_Disc", w_disc, collection="1_Info")
+
+            r = w_task * task_r + w_disc * disc_r
+            # <<< 课程学习新增 <<<
+        else:
+            r = self._task_reward_weight * task_r + self._disc_reward_weight * disc_r
         self._exp_buffer.set_data_flat("reward", r)
         
         disc_reward_std, disc_reward_mean = torch.std_mean(disc_r)
@@ -130,47 +138,69 @@ class AMPAgent(ppo_agent.PPOAgent):
             "disc_reward_std": disc_reward_std
         }
         return info
-    
-    def _update_model(self):
-        info = super()._update_model()
-        
-        num_envs = self.get_num_envs()
-        num_samples = self._exp_buffer.get_sample_count()
 
-        disc_batch_size = int(np.ceil(self._disc_batch_size * num_envs))
-        num_disc_batches = int(np.ceil(float(num_samples) / disc_batch_size))
-        num_disc_steps = num_disc_batches * self._disc_epochs
-        disc_info = self._update_disc(disc_batch_size, num_disc_steps)
-        
+    def _compute_loss(self, batch):
+        info = super()._compute_loss(batch)
+
+        disc_info = self._compute_disc_loss(batch)
+        disc_loss = disc_info["disc_loss"]
+
+        loss = info["loss"]
+        loss = loss + self._disc_loss_weight * disc_loss
+
+        # # ====== 新增：计算状态估计 SE MSE Loss ======
+        # if self._enable_se:
+        #     obs = batch["obs"]  # PPO的batch数据，已被自动归一化
+        #     prop_dim = self._env.prop_dim
+        #     priv_dim = self._env.priv_dim
+        #
+        #     # 切片拿到 GT 和 历史
+        #     gt_priv = obs[..., prop_dim: prop_dim + priv_dim]
+        #     hist_obs = obs[..., prop_dim + priv_dim:]
+        #
+        #     # 用当前最新的网络预测一波
+        #     pred_priv = self._model._se_net(hist_obs)
+        #
+        #     # # 计算监督损失
+        #     # se_loss = torch.nn.functional.mse_loss(pred_priv, gt_priv)
+        #     # loss = loss + self._se_loss_weight * se_loss
+        #     #
+        #     # disc_info["se_loss"] = se_loss.detach()  # 记录到日志中方便监控
+        #
+        #     # 3. 对真实的特权信息进行暴力截断 (Clamp)
+        #     # 防止摔倒瞬间产生的极端速度突变（比如超过 5.0 的离谱值）撑爆 Loss
+        #     gt_priv_clipped = torch.clamp(gt_priv, min=-5.0, max=5.0)
+        #
+        #     # 4. 换用 Smooth L1 Loss (Huber Loss) 替代 MSE
+        #     # 当误差小于 1 时，它是平滑的 L2 损失；当误差大于 1 时，它变成线性的 L1 损失。
+        #     # 这对处理 RL 训练早期的异常值极其有效，彻底杜绝梯度爆炸！
+        #     se_loss = torch.nn.functional.smooth_l1_loss(pred_priv, gt_priv_clipped)
+        #
+        #     # --- 关键修改结束 ---
+        #
+        #     loss = loss + self._se_loss_weight * se_loss
+        #
+        #     disc_info["se_loss"] = se_loss.detach()
+        # # ============================================
+        info["loss"] = loss
         info = {**info, **disc_info}
-        return info
-
-    def _update_disc(self, batch_size, steps):
-        info = dict()
-
-        for i in range(steps):
-            batch = self._exp_buffer.sample(batch_size)
-            loss_info = self._compute_disc_loss(batch)
-            loss = loss_info["disc_loss"]
-            self._disc_optimizer.step(loss)
-
-            torch_util.add_torch_dict(loss_info, info)
-        
-        torch_util.scale_torch_dict(1.0 / steps, info)
         return info
     
     def _compute_disc_loss(self, batch):
         disc_obs = batch["disc_obs"]
         disc_demo_obs = batch["disc_obs_demo"]
 
+        disc_demo_obs = disc_demo_obs[:self._disc_batch_size]
         norm_disc_obs_demo = self._disc_obs_norm.normalize(disc_demo_obs)
         norm_disc_obs_demo.requires_grad_(True)
         
+        agent_samples = int(np.ceil(self._disc_batch_size / 2))
+        disc_obs = disc_obs[:agent_samples]
+
         replay_data = self._disc_buffer.sample(disc_obs.shape[0])
         replay_obs = replay_data["disc_obs"]
         disc_obs = torch.cat([disc_obs, replay_obs], dim=0)
         norm_disc_obs = self._disc_obs_norm.normalize(disc_obs)
-        norm_disc_obs.requires_grad_(True)
 
         disc_agent_logit = self._model.eval_disc(norm_disc_obs)
         disc_demo_logit = self._model.eval_disc(norm_disc_obs_demo)
@@ -186,13 +216,7 @@ class AMPAgent(ppo_agent.PPOAgent):
                                              create_graph=True, retain_graph=True, only_inputs=True)
         disc_demo_grad = disc_demo_grad[0]
         disc_demo_grad = torch.sum(torch.square(disc_demo_grad), dim=-1)
-
-        disc_agent_grad = torch.autograd.grad(disc_agent_logit, norm_disc_obs, grad_outputs=torch.ones_like(disc_agent_logit),
-                                             create_graph=True, retain_graph=True, only_inputs=True)
-        disc_agent_grad = disc_agent_grad[0]
-        disc_agent_grad = torch.sum(torch.square(disc_agent_grad), dim=-1)
-
-        disc_grad_penalty = 0.5 * (torch.mean(disc_demo_grad) + torch.mean(disc_agent_grad))
+        disc_grad_penalty = torch.mean(disc_demo_grad)
         disc_loss += self._disc_grad_penalty * disc_grad_penalty
 
         disc_agent_acc, disc_demo_acc = self._compute_disc_acc(disc_agent_logit, disc_demo_logit)
@@ -214,7 +238,14 @@ class AMPAgent(ppo_agent.PPOAgent):
             disc_logit_loss = torch.sum(torch.square(logit_weights))
             disc_loss += self._disc_logit_reg * disc_logit_loss
             disc_info["disc_logit_loss"] = disc_logit_loss.detach()
-        
+            
+        if (self._disc_weight_decay != 0):
+            disc_weights = self._model.get_disc_weights()
+            disc_weights = torch.cat(disc_weights, dim=-1)
+            disc_weight_decay = torch.sum(torch.square(disc_weights))
+            disc_loss += self._disc_weight_decay * disc_weight_decay
+            disc_info["disc_weight_decay"] = disc_weight_decay.detach()
+
         return disc_info
 
     def _disc_loss_neg(self, disc_logits):

@@ -13,9 +13,8 @@ import learning.normalizer as normalizer
 import learning.return_tracker as return_tracker
 from util.logger import Logger
 import util.mp_util as mp_util
-import util.torch_util as torch_util
-import util.logger as logger
 import util.tb_logger as tb_logger
+import util.torch_util as torch_util
 import util.wandb_logger as wandb_logger
 
 import learning.distribution_gaussian_diag as distribution_gaussian_diag
@@ -26,6 +25,11 @@ class AgentMode(enum.Enum):
 
 class BaseAgent(torch.nn.Module):
     def __init__(self, config, env, device):
+        self.dynamics_weight = getattr(env, "use_commands", False)
+        self._enable_rma = getattr(env, "_enable_rma", False)
+        self._enable_se = getattr(env, "_enable_se", False)
+        self._se_loss_weight = config.get("se_loss_weight", 1.0)
+        self.use_ts_loss = config.get("use_ts_loss", False)
         super().__init__()
 
         self._env = env
@@ -50,12 +54,13 @@ class BaseAgent(torch.nn.Module):
         return
 
     def train_model(self, max_samples, out_dir, save_int_models, logger_type):
+        self._max_samples = max_samples  # 保存总样本数
         start_time = time.time()
 
         out_model_file = os.path.join(out_dir, "model.pt")
         log_file = os.path.join(out_dir, "log.txt")
         self._logger = self._build_logger(logger_type, log_file, self._config)
-        
+
         if (save_int_models):
             int_out_dir = os.path.join(out_dir, "int_models")
             if (mp_util.is_root_proc() and not os.path.exists(int_out_dir)):
@@ -75,7 +80,7 @@ class BaseAgent(torch.nn.Module):
             if (output_iter):
                 test_info = self.test_model(self._test_episodes)
             
-            env_diag_info = self._env.record_diagnostics()
+            env_diag_info = self._env.get_diagnostics()
             self._log_train_info(train_info, test_info, env_diag_info, start_time) 
             self._logger.print_log()
 
@@ -93,7 +98,11 @@ class BaseAgent(torch.nn.Module):
     def test_model(self, num_episodes):
         self.eval()
         self.set_mode(AgentMode.TEST)
-        
+
+        # === 新增：初始化第一帧打印标志 ===
+        self._is_first_test_step = True
+        # ==============================
+
         num_procs = mp_util.get_num_procs()
         num_eps_proc = int(np.ceil(num_episodes / num_procs))
 
@@ -134,7 +143,57 @@ class BaseAgent(torch.nn.Module):
 
     def load(self, in_file):
         state_dict = torch.load(in_file, map_location=self._device)
-        self.load_state_dict(state_dict)
+
+        current_state_dict = self.state_dict()
+        new_state_dict = {}
+
+        # 1. 自动处理尺寸不匹配的问题 (切片截取旧模型的有效参数)
+        for k, v in state_dict.items():
+            if k in current_state_dict:
+                current_v = current_state_dict[k]
+                if v.shape == current_v.shape:
+                    new_state_dict[k] = v
+                else:
+                    Logger.print(
+                        f"[参数修剪] {k}: 旧尺寸 {v.shape} -> 新尺寸 {current_v.shape}，正在进行切片保留前部特征...")
+                    # 如果是 1D 张量 (比如 bias 或者 normalizer)
+                    if len(v.shape) == 1 and len(current_v.shape) == 1:
+                        min_dim = min(v.shape[0], current_v.shape[0])
+                        new_state_dict[k] = current_v.clone()
+                        new_state_dict[k][:min_dim] = v[:min_dim]
+                    # 如果是 2D 张量 (比如 Linear 层的 weight)
+                    elif len(v.shape) == 2 and len(current_v.shape) == 2:
+                        min_dim0 = min(v.shape[0], current_v.shape[0])
+                        min_dim1 = min(v.shape[1], current_v.shape[1])
+                        new_state_dict[k] = current_v.clone()
+                        new_state_dict[k][:min_dim0, :min_dim1] = v[:min_dim0, :min_dim1]
+                    else:
+                        new_state_dict[k] = v
+            else:
+                new_state_dict[k] = v
+
+        # 2. 补全缺失的 Critic 归一化器 (从旧的 obs_norm 复制并切片)
+        for suffix in ["_count", "_mean", "_std"]:
+            critic_key = f"_critic_obs_norm.{suffix}"
+            obs_key = f"_obs_norm.{suffix}"
+            if critic_key not in state_dict and obs_key in state_dict:
+                old_v = state_dict[obs_key]
+                current_v = current_state_dict.get(critic_key)
+                if current_v is not None:
+                    new_v = current_v.clone()
+                    if len(old_v.shape) > 0:  # mean 和 std
+                        min_dim = min(old_v.shape[0], current_v.shape[0])
+                        new_v[:min_dim] = old_v[:min_dim]
+                    else:  # count (标量)
+                        new_v = old_v
+                    new_state_dict[critic_key] = new_v
+
+        # 3. 使用 strict=False 宽容模式加载，允许出现多余或缺失的键
+        missing_keys, unexpected_keys = self.load_state_dict(new_state_dict, strict=False)
+
+        if missing_keys:
+            Logger.print(f"[警告] 缺少部分键值 (可能是新增的网络结构): {missing_keys}")
+
         self._sync_optimizer()
         Logger.print("Loaded model parameters from {:s}".format(in_file))
         return
@@ -143,7 +202,7 @@ class BaseAgent(torch.nn.Module):
         params = self.parameters()
         num_params = sum(p.numel() for p in params if p.requires_grad)
         return num_params
-    
+
     def _load_params(self, config):
         self._discount = config["discount"]
         self._iters_per_output = config["iters_per_output"]
@@ -153,10 +212,23 @@ class BaseAgent(torch.nn.Module):
         self._steps_per_iter = config["steps_per_iter"]
         return
 
+    @abc.abstractmethod
+    def _build_model(self, config):
+        return
+
     def _build_normalizers(self):
         obs_space = self._env.get_obs_space()
         obs_dtype = torch_util.numpy_dtype_to_torch(obs_space.dtype)
         self._obs_norm = normalizer.Normalizer(obs_space.shape, clip=10.0, device=self._device, dtype=obs_dtype)
+
+        # === 新增：构建 Critic 专属归一化器 ===
+        if hasattr(self._env, "get_critic_obs_space"):
+            critic_obs_space = self._env.get_critic_obs_space()
+        else:
+            critic_obs_space = self._env.get_obs_space()
+        c_obs_dtype = torch_util.numpy_dtype_to_torch(critic_obs_space.dtype)
+        self._critic_obs_norm = normalizer.Normalizer(critic_obs_space.shape, clip=10.0, device=self._device,
+                                                      dtype=c_obs_dtype)
 
         self._a_norm = self._build_action_normalizer()
         return
@@ -183,7 +255,18 @@ class BaseAgent(torch.nn.Module):
             assert(False), "Unsupported action space: {}".format(a_space)
 
         return a_norm
+
+    def _build_optimizer(self, config):
+        opt_config = config["optimizer"]
+        params = list(self.parameters())
+        params = [p for p in params if p.requires_grad]
+        self._optimizer = mp_optimizer.MPOptimizer(opt_config, params)
+        return
     
+    def _sync_optimizer(self):
+        self._optimizer.sync()
+        return
+
     def _build_exp_buffer(self, config):
         buffer_length = self._get_exp_buffer_length()
         batch_size = self.get_num_envs()
@@ -196,10 +279,12 @@ class BaseAgent(torch.nn.Module):
         self._test_return_tracker = return_tracker.ReturnTracker(self.get_num_envs(), self._device)
         return
 
+    @abc.abstractmethod
+    def _get_exp_buffer_length(self):
+        return 0
+    
     def _build_logger(self, logger_type, log_file, config):
-        if (logger_type == "txt"):
-            log = logger.Logger()
-        elif (logger_type == "tb"):
+        if (logger_type == "tb"):
             log = tb_logger.TBLogger()
         elif (logger_type == "wandb"):
             log = wandb_logger.WandbLogger("mimickit", config)
@@ -227,7 +312,13 @@ class BaseAgent(torch.nn.Module):
 
     def _train_iter(self):
         self._init_iter()
-        
+
+        # >>> 课程学习新增：计算进度并下发给 Env >>>
+        if hasattr(self, '_max_samples') and hasattr(self._env, 'set_progress'):
+            progress = np.clip(self._sample_count / max(1, self._max_samples), 0.0, 1.0)
+            self._env.set_progress(progress)
+        # <<< 课程学习新增 <<<
+
         self.eval()
         self.set_mode(AgentMode.TRAIN)
 
@@ -282,6 +373,17 @@ class BaseAgent(torch.nn.Module):
             while True:
                 action, action_info = self._decide_action(self._curr_obs, self._curr_info)
 
+                # ==================== 新增：仅打印测试的第一帧数据 ====================
+                if getattr(self, "_is_first_test_step", False):
+                    print("\n" + "🌟" * 20)
+                    print(" 🟢 [TEST FIRST STEP] Observation & Action (Env 0) ")
+                    print("-" * 60)
+                    print(f"👉 [OBS] Shape {self._curr_obs.shape}:\n{self._curr_obs[0].detach().cpu().numpy()}")
+                    print(f"👉 [ACTION] Shape {action.shape}:\n{action[0].detach().cpu().numpy()}")
+                    print("🌟" * 20 + "\n")
+                    self._is_first_test_step = False  # 打印完立马关掉，后续 reset 也不再打印
+                # =================================================================
+
                 next_obs, r, done, next_info = self._step_env(action)
                 self._test_return_tracker.update(r, done)
             
@@ -300,20 +402,37 @@ class BaseAgent(torch.nn.Module):
             }
         return test_info
 
+    @abc.abstractmethod
+    def _decide_action(self, obs, info):
+        a = None
+        a_info = dict()
+        return a, a_info
+
     def _step_env(self, action):
         obs, r, done, info = self._env.step(action)
         return obs, r, done, info
 
     def _record_data_pre_step(self, obs, info, action, action_info):
         self._exp_buffer.record("obs", obs)
+
+        # === 新增：提取并记录 critic_obs ===
+        critic_obs = info.get("critic_obs", obs)
+        self._exp_buffer.record("critic_obs", critic_obs)
+
         self._exp_buffer.record("action", action)
         
         if (self._need_normalizer_update()):
             self._obs_norm.record(obs)
+            self._critic_obs_norm.record(critic_obs)  # 新增
         return
 
     def _record_data_post_step(self, next_obs, r, done, next_info):
         self._exp_buffer.record("next_obs", next_obs)
+
+        # === 新增：提取并记录 next_critic_obs ===
+        next_critic_obs = next_info.get("critic_obs", next_obs)
+        self._exp_buffer.record("next_critic_obs", next_critic_obs)
+
         self._exp_buffer.record("reward", r)
         self._exp_buffer.record("done", done)
         return
@@ -326,6 +445,13 @@ class BaseAgent(torch.nn.Module):
 
     def _reset_envs(self, env_ids=None):
         obs, info = self._env.reset(env_ids)
+        # === 修改：环境 Reset 时，用 info 里传来的【真实关节角】初始化 last_action ===
+        if hasattr(self, "_last_action_buf"):
+            current_dof_pos = info["dof_pos"]  # 直接从字典拿，绝不报错
+            if env_ids is None:
+                self._last_action_buf.copy_(current_dof_pos)
+            else:
+                self._last_action_buf[env_ids] = current_dof_pos[env_ids]
         return obs, info
 
     def _need_normalizer_update(self):
@@ -333,10 +459,16 @@ class BaseAgent(torch.nn.Module):
 
     def _update_normalizers(self):
         self._obs_norm.update()
+        if hasattr(self, "_critic_obs_norm"):  # 新增
+            self._critic_obs_norm.update()
         return
 
     def _build_train_data(self):
         return dict()
+
+    @abc.abstractmethod
+    def _update_model(self):
+        return
 
     def _compute_succ_val(self):
         r_succ = self._env.get_reward_succ()
@@ -386,13 +518,11 @@ class BaseAgent(torch.nn.Module):
         
         obs_norm_mean = self._obs_norm.get_mean()
         obs_norm_std = self._obs_norm.get_std()
+        obs_norm_mean = torch.mean(torch.abs(obs_norm_mean)).item()
+        obs_norm_std = torch.mean(obs_norm_std).item()
 
-        if (obs_norm_mean.dtype == torch.float32):
-            obs_norm_mean = torch.mean(torch.abs(obs_norm_mean)).item()
-            obs_norm_std = torch.mean(obs_norm_std).item()
-            self._logger.log("Obs_Norm_Mean", obs_norm_mean, quiet=True)
-            self._logger.log("Obs_Norm_Std", obs_norm_std, quiet=True)
-        
+        self._logger.log("Obs_Norm_Mean", obs_norm_mean, quiet=True)
+        self._logger.log("Obs_Norm_Std", obs_norm_std, quiet=True)
         return
     
     def _compute_action_bound_loss(self, norm_a_dist):
@@ -423,30 +553,4 @@ class BaseAgent(torch.nn.Module):
         if (int_out_dir != ""):
             int_model_file = os.path.join(int_out_dir, "model_{:010d}.pt".format(iter))
             self.save(int_model_file)
-        return
-    
-    @abc.abstractmethod
-    def _build_model(self, config):
-        return
-    
-    @abc.abstractmethod
-    def _build_optimizer(self, config):
-        return
-
-    @abc.abstractmethod
-    def _get_exp_buffer_length(self):
-        return 0
-    
-    @abc.abstractmethod
-    def _sync_optimizer(self):
-        return
-
-    @abc.abstractmethod
-    def _decide_action(self, obs, info):
-        a = None
-        a_info = dict()
-        return a, a_info
-    
-    @abc.abstractmethod
-    def _update_model(self):
         return

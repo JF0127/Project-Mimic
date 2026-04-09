@@ -1,0 +1,108 @@
+env_name: "amp"
+# ====== 非对称观测 ======
+asymmetric_obs: True  # Actor 187维（无特权），Critic 207维（全量）
+# ================================
+char_file: "data/assets/v47/mjcf/v47_inertia_v3all_lmt_2.xml"
+camera_mode: "track"
+
+episode_length: 10.0 # seconds
+global_obs: True
+root_height_obs: True
+pose_termination: False
+enable_phase_obs: False
+enable_tar_obs: False
+num_disc_obs_steps: 10
+rand_reset: True
+zero_center_action: False
+
+ref_char_offset: [2.0, 0.0, 0.0] # m
+init_pose: [
+    0.0, 0.0, 0.8,  # Root Position (x, y, z)
+    0.0, 0.0, 0.0,  # Root Rotation (Roll, Pitch, Yaw)
+    -0.25,  -0.03,  -0.01,  -0.5,  0.23,   -0.01,
+    0.25,   0.03,   -0.01,  0.5,   -0.23,  0.01,
+    0,0,
+    0,   0,0,    -1,
+    0,    0,0,    1,
+  ]
+
+init_pose_real: [
+    0.0, 0.0, 0.62,  # Root Position (x, y, z)
+    0.0, 0.0, 0,     # Root Rotation (Roll, Pitch, Yaw)
+     -0.25, -0.03, -0.01, -0.5,  0.15, -0.01,
+    0.25,   0.03, 0.01,  0.5, -0.15,  0.01,
+    0,0,
+    0,   0,0,    -1,
+    0,    0,0,    1,
+  ]
+enable_early_termination: True
+key_bodies: [
+  "head_link",
+  "right_hand_link",
+  "left_hand_link",
+  "right_ankle_roll_link",
+  "left_ankle_roll_link"
+]
+contact_bodies: [
+  "left_knee_link",
+  "left_ankle_pitch_link",
+  "left_ankle_roll_link",
+  "right_knee_link",
+  "right_ankle_pitch_link",
+  "right_ankle_roll_link"
+]
+
+motion_file: "data/motions/v47_self/GMR_VID_20260330_204103.pkl"
+
+reward_pose_w: 0.5
+reward_vel_w: 0.1
+reward_root_pose_w: 0.15
+reward_root_vel_w: 0.1
+reward_key_pos_w: 0.15
+
+reward_pose_scale: 0.25
+reward_vel_scale: 0.01
+reward_root_pose_scale: 5.0
+reward_root_vel_scale: 1.0
+reward_key_pos_scale: 10.0
+
+# ====== 状态初始化 ======
+state_init_mode: "Real"
+
+hybrid_init_probs: [0.3, 0.15, 0.15, 0.4]
+
+init_noise_std: [0.02, 0.05, 0.02, 0.01]
+
+init_noise_std_dof: [
+  0.006, 0.033, 0.002, 0.055, 0.166, 0.017,
+  0.006, 0.033, 0.002, 0.055, 0.166, 0.017,
+  0.071, 0.005,
+  0.118, 0.032, 0.033, 0.098,
+  0.118, 0.032, 0.033, 0.098
+]
+
+use_commands: False
+enable_mirror_aug: False
+# ====== RMA 观测侧开关（只影响 Critic 特权信息维度，不影响模型结构）======
+enable_rma: True
+# ==============================
+obs_noise: True
+
+# ====== 外力扰动（原始训练未开启）======
+domain_rand:
+  push_robots: False
+  push_interval_s: 8
+  push_duration_s: 0.4
+  max_push_force: 80
+  push_bodies: ["waist_link"]
+
+enable_action_pd_limit: False
+action_pd_threshold: [
+  0.10, 0.10, 0.10, 0.15, 0.25, 0.10,
+  0.10, 0.10, 0.10, 0.15, 0.25, 0.10,
+  0.15, 0.10,
+  0.20, 0.10, 0.10, 0.20,
+  0.20, 0.10, 0.10, 0.20
+]
+
+use_physical_bound_loss: True

@@ -1,245 +1,75 @@
-# CLAUDE.md — MimicKit: MVR 22DOF AMP 训练全流程
+## V47 22DOF 行走训练
 
-本文件描述以 **MVR_22DOF 机器人** 为目标，基于 **GMR 生成的动作数据**，使用 **MimicKit + IsaacLab** 训练 AMP（Adversarial Motion Priors）控制器的完整流程。使用 `uv` 作为包管理器。
+包含 RMA、非对称观测、域随机化等完整特性的 AMP 行走控制方案。
 
----
+### 关键特性
 
-## 项目结构
+- **非对称观测**：Actor 187维（无特权），Critic 207维（全量）
+- **域随机化**：Push robots，80N 外力，8s 间隔，作用于 `waist_link`
+- **状态初始化**：`state_init_mode: "Real"`（真实站立姿态 + 逐关节噪声）
+- **动作平滑**：`action_smooth_weight: 0.02` 限制时序跳变
+- **物理边界惩罚**：`use_physical_bound_loss: True` 梯度逼迫遵守关节限位
+- **统一优化器**：disc loss 集成进 PPO combined loss（`disc_loss_weight: 5`）
 
-```
-Project-Mimic/
-├── MimicKit/                         # 本目录：RL 训练框架
-│   ├── mimickit/                     # 核心库（AMP/ASE/AWR 等算法）
-│   ├── data/
-│   │   ├── assets/mvr_22dof/         # MVR 22DOF MuJoCo 模型
-│   │   ├── envs/amp_mvr_22dof_env.yaml   # AMP 环境配置
-│   │   ├── agents/amp_humanoid_agent.yaml # AMP 智能体配置（可复用）
-│   │   ├── engines/isaac_lab_engine.yaml  # IsaacLab 引擎配置
-│   │   └── motions/mvr_22dof/        # 放置转换后的动作文件（需手动创建）
-│   ├── tools/gmr_to_mimickit/        # GMR → MimicKit 格式转换工具
-│   └── output/                       # 训练输出（模型、日志）
-├── GMR/
-│   └── output/jhl_marktime.pkl       # GMR 已生成的动作文件（起点）
-└── thirdparty/IsaacLab/              # IsaacLab 子模块
-```
+### 观测维度说明
 
----
+机器人共 27 个 body（含 4 个虚拟末端 toe/hand），kinematic model 保留全部 26 个非根关节旋转：
 
-## 第一步：环境配置（uv + IsaacLab）
-
-### 1.1 安装 uv
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source $HOME/.local/bin/env
-```
-
-### 1.2 创建虚拟环境（Python 3.10）
-
-```bash
-cd /home/jhl/projects/Project-Mimic/MimicKit
-uv venv .venv --python 3.10
-source .venv/bin/activate
-```
-
-### 1.3 安装 IsaacSim（通过 pip wheel）
-
-IsaacLab 需要先安装 IsaacSim。使用 NGC pip 源：
-
-```bash
-uv pip install torch==2.4.0 torchvision --index-url https://download.pytorch.org/whl/cu121
-
-uv pip install \
-  isaacsim-rl \
-  isaacsim-replicator \
-  isaacsim-extscache-physics \
-  isaacsim-extscache-kit \
-  isaacsim-extscache-kit-sdk \
-  --extra-index-url https://pypi.nvidia.com
-```
-
-> **注意**：若使用的是 IsaacSim 4.x，包名可能为 `isaacsim==4.x.x`，请以 [NVIDIA IsaacLab 安装文档](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html) 为准。本项目测试的 IsaacLab commit 为 `2ed331acfcbb1b96c47b190564476511836c3754`。
-
-### 1.4 安装 IsaacLab
-
-```bash
-cd /home/jhl/projects/Project-Mimic/thirdparty/IsaacLab
-# 以 editable 模式安装所有 IsaacLab 扩展
-./isaaclab.sh --install  # 或手动：uv pip install -e .
-```
-
-若 `isaaclab.sh` 不适用，可手动安装：
-
-```bash
-uv pip install -e /home/jhl/projects/Project-Mimic/thirdparty/IsaacLab
-```
-
-### 1.5 安装 MimicKit 依赖
-
-```bash
-cd /home/jhl/projects/Project-Mimic/MimicKit
-uv pip install -r requirements.txt
-```
+| 分量 | 维度 | 说明 |
+|------|------|------|
+| root_rot (tan_norm) | 6 | 全局朝向 |
+| root_ang_vel | 3 | 全局角速度 |
+| joint_rot_obs | 156 | 26 joints × 6 |
+| dof_vel | 22 | 关节速度 |
+| **Actor 合计** | **187** | prop_obs，无特权 |
+| root_height | 1 | 特权：高度 |
+| root_vel | 3 | 特权：线速度 |
+| key_pos | 15 | 特权：5关键体位置 |
+| push_flag | 1 | 特权：外力扰动标志 |
+| **Critic 合计** | **207** | full_obs，全量 |
+| **Disc 合计** | **2080** | 208 × 10 步 |
 
 ---
 
-## 第二步：动作数据转换（GMR → MimicKit）
-
-GMR 已生成 `GMR/output/jhl_marktime.pkl`，需将其转换为 MimicKit 格式并放置到正确目录。
-
-### 2.1 创建动作目录
-
-```bash
-mkdir -p /home/jhl/projects/Project-Mimic/MimicKit/data/motions/mvr_22dof
-```
-
-### 2.2 运行格式转换脚本
-
-从 `MimicKit/` 根目录运行：
-
-```bash
-cd /home/jhl/projects/Project-Mimic/MimicKit
-
-python tools/gmr_to_mimickit/gmr_to_mimickit.py \
-  --input_file  ../GMR/output/jhl_marktime.pkl \
-  --output_file data/motions/mvr_22dof/mvr_marktime.pkl \
-  --loop wrap
-```
-
-**参数说明：**
-- `--loop wrap`：动作循环播放（适合 marktime 踏步类动作）
-- `--loop clamp`：动作播放到末帧后停止
-- `--start_frame` / `--end_frame`：可选，裁剪动作片段
-- `--output_fps`：可选，重采样帧率（默认保持原帧率）
-
-转换成功后会打印动作帧数、FPS 等信息。
-
-### 2.3 （可选）可视化验证动作
-
-用 `view_motion` 环境验证转换结果：
-
-```bash
-python mimickit/run.py \
-  --mode test \
-  --engine_config data/engines/isaac_lab_engine.yaml \
-  --env_config data/envs/view_motion_mvr_env.yaml \
-  --visualize true
-```
-
-> 若无 `view_motion_mvr_env.yaml`，可参考 `data/envs/view_motion_humanoid_env.yaml` 复制并修改 `char_file` 和 `motion_file` 字段。
-
----
-
-## 第三步：确认配置文件
-
-### 3.1 环境配置（已存在）
-
-`data/envs/amp_mvr_22dof_env.yaml`：
-
-```yaml
-env_name: "amp"
-char_file: "data/assets/mvr_22dof/Mvr_22dof.xml"
-episode_length: 10.0
-motion_file: "data/motions/mvr_22dof/mvr_marktime.pkl"   # ← 第二步生成的文件
-
-key_bodies: ["head_link", "left_ankle_roll_link", "right_ankle_roll_link",
-             "left_hand_link", "right_hand_link"]
-contact_bodies: ["left_knee_link", "left_ankle_pitch_link", "left_ankle_roll_link",
-                 "right_knee_link", "right_ankle_pitch_link", "right_ankle_roll_link"]
-
-reward_pose_w: 0.5        # 关节姿态奖励权重
-reward_vel_w: 0.1         # 速度奖励权重
-reward_root_pose_w: 0.15  # 根节点姿态奖励权重
-reward_root_vel_w: 0.1    # 根节点速度奖励权重
-reward_key_pos_w: 0.15    # 关键点位置奖励权重
-```
-
-> 若将动作文件放在不同路径，修改 `motion_file` 字段。
-
-### 3.2 机器人模型（已存在）
-
-确认 MVR 22DOF 机器人模型已就绪：
-
-```bash
-ls data/assets/mvr_22dof/
-# 应包含：Mvr_22dof.xml、Mvr_22dof.urdf、meshes/
-```
-
-若 `data/assets/mvr_22dof/` 不存在，需将 GMR 的机器人模型链接过来：
-
-```bash
-ln -s /home/jhl/projects/Project-Mimic/GMR/assets/mvr_22dof \
-      /home/jhl/projects/Project-Mimic/MimicKit/data/assets/mvr_22dof
-```
-
-### 3.3 智能体配置
-
-使用通用 AMP 智能体配置（`data/agents/amp_humanoid_agent.yaml`）即可，MVR 22DOF 无需单独 agent yaml。
-
----
-
-## 第四步：AMP 训练
-
-从 `MimicKit/` 根目录运行，确保 `.venv` 已激活：
+## Play（测试已训练模型）
 
 ```bash
 cd /home/jhl/projects/Project-Mimic/MimicKit
 source .venv/bin/activate
 
-python mimickit/run.py \
-  --mode train \
-  --num_envs 4096 \
-  --engine_config data/engines/isaac_lab_engine.yaml \
-  --env_config data/envs/amp_mvr_22dof_env.yaml \
-  --agent_config data/agents/amp_humanoid_agent.yaml \
-  --visualize false \
-  --out_dir output/amp_mvr_22dof_marktime/ \
-  --logger tb
-```
+# 方式一：arg_file（推荐）
+python mimickit/run.py --arg_file args/amp_v47_walk_play_args.txt
 
-**关键参数：**
-- `--num_envs 4096`：并行环境数，显存不足时可降低（如 1024/2048）
-- `--visualize false`：训练时关闭渲染以加速
-- `--out_dir`：模型和日志保存目录
-- `--logger tb`：使用 TensorBoard 记录训练曲线（也支持 `wandb`、`txt`）
-
-### 监控训练
-
-```bash
-tensorboard --logdir=output/amp_mvr_22dof_marktime/ --port=6006 --samples_per_plugin scalars=999999
-```
-
-浏览器打开 `http://localhost:6006`。
-
----
-
-## 第五步：测试训练结果
-
-```bash
+# 方式二：完整命令
 python mimickit/run.py \
   --mode test \
-  --num_envs 4 \
-  --engine_config data/engines/isaac_lab_engine.yaml \
-  --env_config data/envs/amp_mvr_22dof_env.yaml \
-  --agent_config data/agents/amp_humanoid_agent.yaml \
-  --visualize true \
-  --model_file output/amp_mvr_22dof_marktime/<model_file>.pt
+  --num_envs 1 \
+  --engine_config data/engines/isaac_gym_engine.yaml \
+  --env_config data/envs/amp_v47_walk_env.yaml \
+  --agent_config data/agents/amp_v47_walk_agent.yaml \
+  --model_file output/amp_mvr_22dof/2026-0402_211536/model.pt
 ```
 
 ---
 
-## 分布式训练（多 GPU）
+## Train（继续训练）
 
 ```bash
+cd /home/jhl/projects/Project-Mimic/MimicKit
+source .venv/bin/activate
+
+# 方式一：arg_file
+python mimickit/run.py --arg_file args/amp_mvr_22dof_args.txt
+
+# 方式二：完整命令
 python mimickit/run.py \
   --mode train \
   --num_envs 4096 \
-  --engine_config data/engines/isaac_lab_engine.yaml \
-  --env_config data/envs/amp_mvr_22dof_env.yaml \
-  --agent_config data/agents/amp_humanoid_agent.yaml \
-  --visualize false \
-  --out_dir output/amp_mvr_22dof_marktime/ \
-  --devices cuda:0 cuda:1
+  --engine_config data/engines/isaac_gym_engine.yaml \
+  --env_config data/envs/amp_v47_walk_env.yaml \
+  --agent_config data/agents/amp_v47_walk_agent.yaml \
+  --out_dir output/amp_v47_walk/ \
+  --logger wandb
 ```
 
 ---
@@ -247,15 +77,15 @@ python mimickit/run.py \
 ## 完整流程速查
 
 ```
-GVHMR（视频）→ GMR（动作重定向）→ GMR/output/jhl_marktime.pkl
+GVHMR（视频）→ GMR（动作重定向）→ GMR/output/*.pkl
                                           ↓
                         gmr_to_mimickit.py（格式转换）
                                           ↓
-                  data/motions/mvr_22dof/mvr_marktime.pkl
+                  data/motions/v47_self/GMR_VID_*.pkl
                                           ↓
-          MimicKit AMP 训练（IsaacLab 引擎 + amp_mvr_22dof_env.yaml）
+          MimicKit AMP 训练（IsaacGym 引擎 + amp_v47_walk_env.yaml）
                                           ↓
-                     output/amp_mvr_22dof_marktime/*.pt
+                     output/amp_v47_walk/*.pt
 ```
 
 ---
@@ -264,12 +94,31 @@ GVHMR（视频）→ GMR（动作重定向）→ GMR/output/jhl_marktime.pkl
 
 | 文件 | 用途 |
 |------|------|
-| `data/envs/amp_mvr_22dof_env.yaml` | AMP 环境配置（奖励权重、机器人、动作文件路径） |
-| `data/agents/amp_humanoid_agent.yaml` | AMP 智能体超参数（网络结构、学习率等） |
-| `data/engines/isaac_lab_engine.yaml` | IsaacLab 引擎配置（控制频率 30Hz，仿真频率 120Hz） |
-| `data/assets/mvr_22dof/Mvr_22dof.xml` | MVR 22DOF 机器人 MuJoCo 模型 |
+| `data/envs/amp_v47_walk_env.yaml` | AMP 行走训练环境配置（非对称观测、Real 初始化、Push 随机化） |
+| `data/agents/amp_v47_walk_agent.yaml` | AMP 行走智能体超参数（SGD 5e-5、action_smooth、无 RMA） |
+| `data/engines/isaac_gym_engine.yaml` | IsaacGym 引擎配置（控制频率 40Hz，仿真频率 200Hz） |
+| `data/assets/v47/mjcf/v47_inertia_v3all_lmt_2.xml` | V47 22DOF 机器人 MuJoCo 模型（含惯性/限位优化） |
+| `data/motions/v47_self/GMR_VID_20260330_204103.pkl` | V47 22DOF 行走动作文件（由 GMR 生成） |
+| `args/amp_v47_walk_play_args.txt` | Play 启动参数文件 |
+| `args/amp_mvr_22dof_args.txt` | Train 启动参数文件 |
+| `output/amp_mvr_22dof/2026-0402_211536/model.pt` | 已训练的行走模型 checkpoint |
 | `tools/gmr_to_mimickit/gmr_to_mimickit.py` | GMR pkl → MimicKit pkl 转换脚本 |
 | `mimickit/run.py` | 训练/测试入口 |
+
+---
+
+## 核心代码改动说明
+
+| 文件 | 主要变化 |
+|------|---------|
+| `mimickit/learning/base_agent.py` | 统一优化器、`_critic_obs_norm`、RMA/SE 标志 |
+| `mimickit/learning/ppo_agent.py` | 集成 disc loss、action smooth/PD/physical bound 惩罚 |
+| `mimickit/learning/amp_agent.py` | disc loss 合并到 combined loss，移除独立 disc optimizer |
+| `mimickit/learning/amp_model.py` | RMA encoder 架构（含 Dropout） |
+| `mimickit/learning/ppo_model.py` | critic 支持 `get_critic_obs_space()` fallback |
+| `mimickit/envs/char_env.py` | `compute_char_obs` 返回4值、`init_pose_real`、action PD limit |
+| `mimickit/envs/deepmimic_env.py` | 5种状态初始化、push robots 域随机化 |
+| `mimickit/envs/amp_env.py` | `fix_root`/`joint_mask`、速度追踪奖励 |
 
 ---
 
@@ -279,10 +128,13 @@ GVHMR（视频）→ GMR（动作重定向）→ GMR/output/jhl_marktime.pkl
 A: 确认 IsaacSim pip 包已安装，或设置 `ISAACSIM_PATH` 环境变量指向本地 IsaacSim 安装目录。
 
 **Q: `char_file` 路径找不到**  
-A: 所有路径均相对于 `MimicKit/` 根目录。务必从该目录运行命令，或使用绝对路径。
+A: 所有路径均相对于 `MimicKit/` 根目录，务必从该目录运行命令。
 
 **Q: 显存不足 OOM**  
-A: 降低 `--num_envs`（如 1024），或在 `amp_mvr_22dof_env.yaml` 中减小 `num_disc_obs_steps`。
+A: 降低 `--num_envs`（如 1024），或在 `amp_v47_walk_env.yaml` 中减小 `num_disc_obs_steps`。
 
 **Q: 动作转换后关节数不匹配**  
-A: 检查 GMR 使用的 IK 配置是否为 `smplx_to_mvr_22dof.json`，确保 `dof_pos` 维度为 22。
+A: 检查 GMR 使用的 IK 配置是否对应 V47 22DOF，确保 `dof_pos` 维度为 22。
+
+**Q: play 时 critic 维度 warning**  
+A: 正常现象。play 时仅用 actor，critic 维度差 1（push_robots 关闭）不影响推理。

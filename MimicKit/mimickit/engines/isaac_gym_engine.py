@@ -133,9 +133,9 @@ class IsaacGymEngine(engine.Engine):
         self._refresh_sim_tensors()
         return
 
-    def create_obj(self, env_id, obj_type, asset_file, name, is_visual=False, enable_self_collisions=True, 
+    def create_obj(self, env_id, obj_type, asset_file, name, is_visual=False, enable_self_collisions=True,
                      fix_root=False, start_pos=None, start_rot=None,
-                     color=None, disable_motors=False):
+                     color=None, disable_motors=False, init_joint_pos=None):
         segmentation_id = 0
 
         _, file_ext = os.path.splitext(asset_file)

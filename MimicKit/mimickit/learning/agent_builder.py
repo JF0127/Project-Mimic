@@ -41,6 +41,6 @@ def build_agent(agent_file, env, device):
     return agent
 
 def load_agent_file(file):
-    with open(file, "r") as stream:
+    with open(file, "r", encoding="utf-8") as stream:
         agent_config = yaml.safe_load(stream)
     return agent_config

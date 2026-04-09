@@ -198,11 +198,11 @@ class SimEnv(base_env.BaseEnv):
         self._timestep_buf = torch.zeros(num_envs, device=self._device, dtype=torch.int)
         self._time_buf = torch.zeros(num_envs, device=self._device, dtype=torch.float)
 
+        self._info = dict()
+
         obs_space = self.get_obs_space()
         obs_dtype = torch_util.numpy_dtype_to_torch(obs_space.dtype)
         self._obs_buf = torch.zeros([num_envs] + list(obs_space.shape), device=self._device, dtype=obs_dtype)
-
-        self._info = dict()
         return
     
     @abc.abstractmethod

@@ -9,6 +9,7 @@ import engines.engine as engine
 import envs.sim_env as sim_env
 import envs.base_env as base_env
 import util.camera as camera
+
 from util.logger import Logger
 import util.torch_util as torch_util
 
@@ -19,9 +20,30 @@ class CharEnv(sim_env.SimEnv):
         self._global_obs = env_config["global_obs"]
         self._root_height_obs = env_config.get("root_height_obs", True)
         self._zero_center_action = env_config.get("zero_center_action", False)
-        
+
+        self._enable_action_pd_limit = env_config.get("enable_action_pd_limit", True)  # 默认 True 兼容你以前的配置
+        if self._enable_action_pd_limit:
+            # 解析游隙阈值 (支持单浮点数，也支持逐关节的列表)
+            pd_thresh = env_config.get("action_pd_threshold", 0.2)
+            if isinstance(pd_thresh, list):
+                self._action_pd_threshold = torch.tensor(pd_thresh, device=device, dtype=torch.float32)
+            else:
+                self._action_pd_threshold = float(pd_thresh)
+        else:
+            self._action_pd_threshold = None
+        self._use_physical_bound_loss = env_config.get("use_physical_bound_loss", False)
+        self._fix_root = env_config.get("fix_root", False)
+
+        # ====== 新增：关节屏蔽配置 ======
+        self._enable_joint_mask = env_config.get("enable_joint_mask", False)
+        self._masked_joint_names = env_config.get("masked_joint_names", [])
+
+        # 新增：是否连带屏蔽掉 hand、toe 等假关节的开关，方便你做消融实验对比
+        self._mask_fake_joints = env_config.get("mask_fake_joints", False)
+        # =================================
+
         super().__init__(env_config=env_config, engine_config=engine_config,
-                         num_envs=num_envs, device=device, visualize=visualize, 
+                         num_envs=num_envs, device=device, visualize=visualize,
                          record_video=record_video)
         
         char_id = self._get_char_id()
@@ -49,13 +71,37 @@ class CharEnv(sim_env.SimEnv):
         self._init_dof_pos = init_dof_pos
         return
 
+    def _parse_init_pose_real(self, init_pose_real, device):
+        dof_size = self._kin_char_model.get_dof_size()
+
+        if (init_pose_real is None):
+            init_pose_real = torch.zeros(6 + dof_size, dtype=torch.float32, device=device)
+        else:
+            init_pose_real = torch.tensor(init_pose_real, device=device)
+
+            if (init_pose_real.shape[-1] == 3):
+                pad_pose = torch.zeros(3 + dof_size, dtype=torch.float32, device=device)
+                init_pose_real = torch.cat([init_pose_real, pad_pose], dim=-1)
+
+        init_root_pos_real, init_root_rot_real, init_dof_pos_real = motion_lib.extract_pose_data(init_pose_real)
+        assert(init_dof_pos_real.shape[-1] == dof_size)
+
+        self._init_root_pos_real = init_root_pos_real
+        self._init_root_rot_real = torch_util.exp_map_to_quat(init_root_rot_real)
+        self._init_dof_pos_real = init_dof_pos_real
+        return
+
     def _build_envs(self, env_config, num_envs):
         char_file = env_config["char_file"]
         self._build_kin_char_model(char_file)
         
         init_pose = env_config.get("init_pose", None)
         self._parse_init_pose(init_pose, self._device)
-        
+
+        # ====== 新增：解析真实的初始位姿 ======
+        init_pose_real = env_config.get("init_pose_real", None)
+        self._parse_init_pose_real(init_pose_real, self._device)
+
         self._char_ids = []
         
         for e in range(num_envs):
@@ -81,13 +127,27 @@ class CharEnv(sim_env.SimEnv):
     
     def _build_character(self, env_id, env_config, color=None):
         char_file = env_config["char_file"]
-        char_id = self._engine.create_obj(env_id=env_id, 
+
+        # 从 yaml init_pose 构建关节名→初始位置字典，用于满足 USD 关节限位校验
+        init_joint_pos = {}
+        dof_idx = 0
+        num_joints = self._kin_char_model.get_num_joints()
+        for j in range(1, num_joints):
+            joint = self._kin_char_model.get_joint(j)
+            dof_dim = joint.get_dof_dim()
+            if dof_dim == 1:
+                init_joint_pos[joint.name] = float(self._init_dof_pos[dof_idx].item())
+                dof_idx += 1
+
+        char_id = self._engine.create_obj(env_id=env_id,
                                           obj_type=engine.ObjType.articulated,
-                                          asset_file=char_file, 
+                                          asset_file=char_file,
                                           name="character",
                                           start_pos=self._init_root_pos.cpu().numpy(),
                                           start_rot=self._init_root_rot.cpu().numpy(),
-                                          color=color)
+                                          fix_root=self._fix_root,
+                                          color=color,
+                                          init_joint_pos=init_joint_pos)
         return char_id
     
     def _build_kin_char_model(self, char_file):
@@ -98,9 +158,6 @@ class CharEnv(sim_env.SimEnv):
         elif (file_ext == ".urdf"):
             import anim.urdf_char_model as urdf_char_model
             char_model = urdf_char_model.URDFCharModel(self._device)
-        elif (file_ext == ".usd"):
-            import anim.usd_char_model as usd_char_model
-            char_model = usd_char_model.USDCharModel(self._device)
         else:
             print("Unsupported character file format: {:s}".format(file_ext))
             assert(False)
@@ -134,7 +191,7 @@ class CharEnv(sim_env.SimEnv):
             low, high = self._build_action_bounds_torque(torque_lim)
 
         elif (control_mode == engine.ControlMode.pos
-              or control_mode == engine.ControlMode.pd_explicit):
+              or control_mode == engine.ControlMode.pd_explicit):       # <=
             char_id = self._get_char_id()
             dof_low, dof_high = self._engine.get_obj_dof_limits(0, char_id)
             low, high = self._build_action_bounds_pos(dof_low, dof_high)
@@ -148,6 +205,63 @@ class CharEnv(sim_env.SimEnv):
             for j in range(1, num_joints):
                 j_dim = self._kin_char_model.get_joint_dof_dim(j)
                 assert(j_dim <= 1), "pd_explicit only supports 1D joints"
+
+        # ====== 核心修复：解耦 DOF 掩码与 Joint_Rot 掩码，并加入假关节开关 ======
+        if getattr(self, "_enable_joint_mask", False) and len(self._masked_joint_names) > 0:
+            char_id = self._get_char_id()
+            dof_names = self._engine.get_obj_dof_names(char_id)
+
+            masked_dof_indices = []
+            masked_joint_rot_indices = []
+
+            # 1. 匹配需要屏蔽的真实电机自由度 (处理 action, dof_pos, dof_vel)
+            for name in self._masked_joint_names:
+                if name in dof_names:
+                    masked_dof_indices.append(dof_names.index(name))
+            self._masked_dof_indices = torch.tensor(masked_dof_indices, dtype=torch.long, device=self._device)
+
+            # 2. 匹配需要屏蔽的 joint_rot (处理观测)
+            num_joints = self._kin_char_model.get_num_joints()
+            for j in range(1, num_joints):
+                joint = self._kin_char_model.get_joint(j)
+                joint_name = joint.name
+
+                # 情况 A: 它是被主动屏蔽的真实关节 (如 ankle, 上肢, 以及我们想焊死的 hip_roll)
+                if joint_name in self._masked_joint_names:
+                    masked_joint_rot_indices.append(j - 1)
+                # 情况 B: 它是假关节 (没有自由度)，且你开启了假关节屏蔽实验
+                elif getattr(self, "_mask_fake_joints", False) and joint.get_dof_dim() == 0:
+                    masked_joint_rot_indices.append(j - 1)
+
+            self._masked_joint_rot_indices = torch.tensor(masked_joint_rot_indices, dtype=torch.long,
+                                                          device=self._device)
+
+            # --- 缩减真实自由度对应的空间 ---
+            dof_size = len(low)
+            mask_dof = torch.ones(dof_size, dtype=torch.bool, device=self._device)
+            if len(self._masked_dof_indices) > 0:
+                mask_dof[self._masked_dof_indices] = False
+            self._unmasked_dof_indices = torch.arange(dof_size, device=self._device)[mask_dof]
+
+            # --- 缩减假关节包含的 joint_rot 空间 ---
+            num_j_rot = num_joints - 1
+            mask_j = torch.ones(num_j_rot, dtype=torch.bool, device=self._device)
+            if len(self._masked_joint_rot_indices) > 0:
+                mask_j[self._masked_joint_rot_indices] = False
+            self._unmasked_joint_rot_indices = torch.arange(num_j_rot, device=self._device)[mask_j]
+
+            # 缩减 low 和 high 数组
+            low = low[mask_dof.cpu().numpy()]
+            high = high[mask_dof.cpu().numpy()]
+
+            # 缩减 PD 阈值
+            if isinstance(self._action_pd_threshold, torch.Tensor) and len(self._masked_dof_indices) > 0:
+                self._action_pd_threshold = self._action_pd_threshold[self._unmasked_dof_indices]
+        else:
+            self._unmasked_dof_indices = torch.arange(len(low), dtype=torch.long, device=self._device)
+            self._unmasked_joint_rot_indices = torch.arange(self._kin_char_model.get_num_joints() - 1,
+                                                            dtype=torch.long, device=self._device)
+        # ========================================================
 
         action_space = spaces.Box(low=low, high=high)
         return action_space
@@ -170,7 +284,7 @@ class CharEnv(sim_env.SimEnv):
             j_dof_dim = curr_joint.get_dof_dim()
 
             if (j_dof_dim > 0):
-                if (j_dof_dim == 3): # 3D spherical j
+                if (j_dof_dim == 3): # 3D spherical j   # ×
                     # spherical joints are modeled as exponential maps
                     # so the bounds are computed a bit differently from revolute joints
                     j_low = curr_joint.get_joint_dof(dof_low)
@@ -182,11 +296,11 @@ class CharEnv(sim_env.SimEnv):
 
                     curr_low = -curr_scale
                     curr_high = curr_scale
-                else:
+                else:                               # <=
                     j_low = curr_joint.get_joint_dof(dof_low)
                     j_high = curr_joint.get_joint_dof(dof_high)
 
-                    if (self._zero_center_action):
+                    if (self._zero_center_action):  # <=
                         curr_mid = np.zeros_like(j_high)
                     else:
                         curr_mid = 0.5 * (j_high + j_low)
@@ -194,7 +308,8 @@ class CharEnv(sim_env.SimEnv):
                     diff_high = np.abs(j_high - curr_mid)
                     diff_low = np.abs(j_low - curr_mid)
                     curr_scale = np.maximum(diff_high, diff_low)
-                    curr_scale *= 1.4
+                    shrink_ratio = 0.99
+                    curr_scale *= shrink_ratio
 
                     curr_low = curr_mid - curr_scale
                     curr_high = curr_mid + curr_scale
@@ -272,22 +387,80 @@ class CharEnv(sim_env.SimEnv):
 
         joint_rot = self._kin_char_model.dof_to_rot(dof_pos)
 
+        # ====== 新增：切除被屏蔽的关节数据 ======
+        if getattr(self, "_enable_joint_mask", False) and len(self._masked_dof_indices) > 0:
+            joint_rot_in = joint_rot[..., self._unmasked_joint_rot_indices, :]
+            dof_vel_in = dof_vel[..., self._unmasked_dof_indices]
+        else:
+            joint_rot_in = joint_rot
+            dof_vel_in = dof_vel
+        # =====================================
+
         if (self._has_key_bodies()):
             key_pos = body_pos[..., self._key_body_ids, :]
         else:
             key_pos = torch.zeros([0], device=self._device)
 
-        obs = compute_char_obs(root_pos=root_pos,
+        if hasattr(self, "commands"):
+            commands = self.commands if env_ids is None else self.commands[env_ids]
+        else:
+            commands = torch.tensor([])
+        # 此时已经拿到了 JIT 函数返回的纯净 tensor，且处于类方法中，可以安全使用 self
+        if getattr(self, "_enable_push", False):
+            # 只要 duration > 0，就认为是 1.0，否则是 0.0
+            # 维度扩展为 [num_envs, 1]
+            is_pushed_bool = (self._push_duration_buf > 0).float().unsqueeze(-1)
+            # ====== 新增：修复维度炸裂的 BUG ======
+            if env_ids is not None:
+                is_pushed_bool = is_pushed_bool[env_ids]
+            # ======================================
+        else:
+            is_pushed_bool = torch.tensor([])
+
+        actor_obs, critic_obs, prop_obs, priv_obs = compute_char_obs(
+                               root_pos=root_pos,
                                root_rot=root_rot, 
                                root_vel=root_vel,
                                root_ang_vel=root_ang_vel,
-                               joint_rot=joint_rot,
-                               dof_vel=dof_vel,
+                               joint_rot=joint_rot_in,  # 修改此处
+                               dof_vel=dof_vel_in,  # 修改此处
                                key_pos=key_pos,
                                global_obs=self._global_obs,
-                               root_height_obs=self._root_height_obs)
-        return obs
-    
+                               root_height_obs=self._root_height_obs,
+                               cmds=commands,
+                               push=is_pushed_bool,
+                               asymmetric_obs=self._asymmetric_obs
+                                                 )
+        # 动态创建并保存 Critic 观测，避免破坏 sim_env.py 里的 self._obs_buf
+        if not hasattr(self, '_critic_obs_buf'):
+            self._critic_obs_buf = torch.zeros([self.get_num_envs(), critic_obs.shape[-1]], device=self._device)
+
+        if env_ids is None:
+            self._critic_obs_buf[:] = critic_obs
+        else:
+            self._critic_obs_buf[env_ids] = critic_obs
+
+        # === 新增：将 critic_obs 放入 info 字典暴露给 Agent ===
+        self._info["critic_obs"] = self._critic_obs_buf
+        # ==========================================================
+        # 【核心新增】：把物理引擎真实的 dof_pos 放进 info 字典，安全传递给 PPO！
+        # 这里必须放缩减后的 dof_pos，否则 ppo_agent 计算 loss 维度不匹配！
+        if getattr(self, "_enable_joint_mask", False) and len(self._masked_dof_indices) > 0:
+            dof_pos_out = dof_pos[:, self._unmasked_dof_indices]
+        else:
+            dof_pos_out = dof_pos
+
+        if not hasattr(self, '_dof_pos_buf'):
+            self._dof_pos_buf = torch.zeros_like(dof_pos_out)
+        if env_ids is None:
+            self._dof_pos_buf[:] = dof_pos_out
+        else:
+            self._dof_pos_buf[env_ids] = dof_pos_out
+        self._info["dof_pos"] = self._dof_pos_buf.clone()
+        # ==========================================================
+        # 只把 Actor 观测 return 给外层，这样 get_obs_space 自动推断维度就是 187
+        return actor_obs
+
     def _reset_envs(self, env_ids):
         super()._reset_envs(env_ids)
 
@@ -326,8 +499,51 @@ class CharEnv(sim_env.SimEnv):
 
     def _apply_action(self, actions):
         char_id = self._get_char_id()
-        clip_action = torch.minimum(torch.maximum(actions, self._action_bound_low), self._action_bound_high)
-        self._engine.set_cmd(char_id, clip_action)
+
+        curr_dof_pos = self._engine.get_dof_pos(char_id)
+
+        # 1. 提取未屏蔽的当前关节角用于游隙限制
+        if getattr(self, "_enable_joint_mask", False) and len(self._masked_dof_indices) > 0:
+            curr_dof_pos_small = curr_dof_pos[:, self._unmasked_dof_indices]
+        else:
+            curr_dof_pos_small = curr_dof_pos
+
+        if self._enable_action_pd_limit:
+
+            # 适配 pd_threshold 张量的缩减
+            if isinstance(self._action_pd_threshold, torch.Tensor) and getattr(self, "_enable_joint_mask", False):
+                pd_thresh_small = self._action_pd_threshold[self._unmasked_dof_indices]
+            else:
+                pd_thresh_small = self._action_pd_threshold
+
+            # 1. 先做相对裁剪（游隙控制/短狗绳）
+            # 现在这里的 _action_pd_threshold 是一个张量，会自动对22个关节进行逐一宽容度计算！
+            smooth_action = torch.clamp(
+                actions,
+                min=curr_dof_pos_small - pd_thresh_small,
+                max=curr_dof_pos_small + pd_thresh_small
+            )
+        else:
+            smooth_action = actions
+
+        # 2. 再做绝对限位裁剪（物理兜底/公园围栏）
+        # 不管网络怎么作妖，发给物理引擎的指令绝对不能超出 XML 设定的边界
+        clip_action = torch.minimum(
+            torch.maximum(smooth_action, self._action_bound_low),
+            self._action_bound_high
+        )
+
+        # 2. 补全动作维度：让被屏蔽的关节锁定在初始设定的位姿参与仿真
+        if getattr(self, "_enable_joint_mask", False) and len(self._masked_dof_indices) > 0:
+            num_envs = actions.shape[0]
+            full_actions = self._init_dof_pos.unsqueeze(0).expand(num_envs, -1).clone()
+            full_actions[:, self._unmasked_dof_indices] = clip_action
+            final_action = full_actions
+        else:
+            final_action = clip_action
+
+        # 下发给底层引擎计算扭矩
+        self._engine.set_cmd(char_id, final_action)
         return
     
     def _build_body_ids_tensor(self, body_names):
@@ -344,7 +560,7 @@ class CharEnv(sim_env.SimEnv):
     
     def _has_key_bodies(self):
         return len(self._key_body_ids) > 0
-    
+
     def _build_camera(self, env_config):
         env_id = 0
         char_id = self._get_char_id()
@@ -408,12 +624,73 @@ def convert_to_local_root_body_pos(root_rot, body_pos):
 
     return local_body_pos
 
+# @torch.jit.script
+# def compute_char_obs(root_pos, root_rot, root_vel, root_ang_vel, joint_rot,
+#                      dof_vel, key_pos, global_obs, root_height_obs, cmds,
+#                      asymmetric_obs):
+#     # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, bool, Tensor, bool) -> Tuple[Tensor, Tensor]
+#     heading_rot = torch_util.calc_heading_quat_inv(root_rot)
+#
+#     if (global_obs):                            # <=
+#         root_rot_obs = torch_util.quat_to_tan_norm(root_rot)
+#         root_vel_obs = root_vel
+#         root_ang_vel_obs = root_ang_vel
+#     else:
+#         local_root_rot = torch_util.quat_mul(heading_rot, root_rot)
+#         root_rot_obs = torch_util.quat_to_tan_norm(local_root_rot)
+#         root_vel_obs = torch_util.quat_rotate(heading_rot, root_vel)
+#         root_ang_vel_obs = torch_util.quat_rotate(heading_rot, root_ang_vel)
+#
+#     joint_rot_flat = torch.reshape(joint_rot, [joint_rot.shape[0] * joint_rot.shape[1], joint_rot.shape[2]])
+#     joint_rot_obs_flat = torch_util.quat_to_tan_norm(joint_rot_flat)
+#     joint_rot_obs = torch.reshape(joint_rot_obs_flat, [joint_rot.shape[0], joint_rot.shape[1] * joint_rot_obs_flat.shape[-1]])
+#
+#     # obs = [root_rot_obs, root_vel_obs, root_ang_vel_obs, joint_rot_obs, dof_vel]
+#     # 1. 组装特权/全量观测 (Critic用)，保持原有的组合顺序
+#     full_obs_list = [root_rot_obs, root_vel_obs, root_ang_vel_obs, joint_rot_obs, dof_vel]
+#
+#     if (len(key_pos) > 0):
+#         root_pos_expand = root_pos.unsqueeze(-2)
+#         key_pos = key_pos - root_pos_expand
+#         if (not global_obs):    # ×
+#             key_pos = convert_to_local_body_pos(root_rot, key_pos)
+#
+#         key_pos_flat = torch.reshape(key_pos, [key_pos.shape[0], key_pos.shape[1] * key_pos.shape[2]])
+#         # obs = obs + [key_pos_flat]
+#         full_obs_list.append(key_pos_flat)
+#
+#     if (root_height_obs):   # <=
+#         root_h = root_pos[:, 2:3]
+#         # obs = [root_h] + obs
+#         full_obs_list = [root_h] + full_obs_list
+#     if len(cmds)>0:
+#         full_obs_list.append(cmds)
+#     # obs = torch.cat(obs, dim=-1)
+#     full_obs_tensor = torch.cat(full_obs_list, dim=-1)
+#
+#     # 2. 根据 asymmetric_obs 开关决定 Actor 观测
+#     if asymmetric_obs:
+#         # 无特权观测 (用于部署): 仅保留 root_rot, root_ang_vel, joint_rot, dof_vel
+#         actor_obs_list = [root_rot_obs, root_ang_vel_obs, joint_rot_obs, dof_vel]
+#         if len(cmds)>0:
+#             actor_obs_list.append(cmds)
+#         actor_obs_tensor = torch.cat(actor_obs_list, dim=-1)
+#     else:
+#         # 对称模式：Actor 也能看到全部特权信息
+#         actor_obs_tensor = full_obs_tensor
+#
+#     # return obs
+#     return actor_obs_tensor, full_obs_tensor
+
+
 @torch.jit.script
-def compute_char_obs(root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel, key_pos, global_obs, root_height_obs):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, bool) -> Tensor
+def compute_char_obs(root_pos, root_rot, root_vel, root_ang_vel, joint_rot,
+                     dof_vel, key_pos, global_obs, root_height_obs, cmds, push,
+                     asymmetric_obs):
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, bool, Tensor, Tensor, bool) -> Tuple[Tensor, Tensor, Tensor, Tensor]
     heading_rot = torch_util.calc_heading_quat_inv(root_rot)
-    
-    if (global_obs):
+
+    if (global_obs):  # <=
         root_rot_obs = torch_util.quat_to_tan_norm(root_rot)
         root_vel_obs = root_vel
         root_ang_vel_obs = root_ang_vel
@@ -425,25 +702,63 @@ def compute_char_obs(root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_
 
     joint_rot_flat = torch.reshape(joint_rot, [joint_rot.shape[0] * joint_rot.shape[1], joint_rot.shape[2]])
     joint_rot_obs_flat = torch_util.quat_to_tan_norm(joint_rot_flat)
-    joint_rot_obs = torch.reshape(joint_rot_obs_flat, [joint_rot.shape[0], joint_rot.shape[1] * joint_rot_obs_flat.shape[-1]])
+    joint_rot_obs = torch.reshape(joint_rot_obs_flat,
+                                  [joint_rot.shape[0], joint_rot.shape[1] * joint_rot_obs_flat.shape[-1]])
 
-    obs = [root_rot_obs, root_vel_obs, root_ang_vel_obs, joint_rot_obs, dof_vel]
+    # obs = [root_rot_obs, root_vel_obs, root_ang_vel_obs, joint_rot_obs, dof_vel]
+    # 1. 组装特权/全量观测 (Critic用)，保持原有的组合顺序
+    full_obs_list = [root_rot_obs, root_vel_obs, root_ang_vel_obs, joint_rot_obs, dof_vel]
 
     if (len(key_pos) > 0):
         root_pos_expand = root_pos.unsqueeze(-2)
         key_pos = key_pos - root_pos_expand
-        if (not global_obs):
+        if (not global_obs):  # ×
             key_pos = convert_to_local_body_pos(root_rot, key_pos)
 
         key_pos_flat = torch.reshape(key_pos, [key_pos.shape[0], key_pos.shape[1] * key_pos.shape[2]])
-        obs = obs + [key_pos_flat]
+        # obs = obs + [key_pos_flat]
+        full_obs_list.append(key_pos_flat)
+    else:
+        key_pos_flat = torch.zeros((root_pos.shape[0], 0), device=root_pos.device)
 
-    if (root_height_obs):
+    if (root_height_obs):  # <=
         root_h = root_pos[:, 2:3]
-        obs = [root_h] + obs
-    
-    obs = torch.cat(obs, dim=-1)
-    return obs
+        # obs = [root_h] + obs
+        full_obs_list = [root_h] + full_obs_list
+    if len(cmds) > 0:
+        full_obs_list.append(cmds)
+    if len(push) > 0:
+        full_obs_list.append(push)
+    full_obs_tensor = torch.cat(full_obs_list, dim=-1)
+
+    # 2. 单独抽取 prop (本体感知)
+    prop_obs_list = [root_rot_obs, root_ang_vel_obs, joint_rot_obs, dof_vel]
+    if len(cmds) > 0:
+        prop_obs_list.append(cmds)
+    prop_obs_tensor = torch.cat(prop_obs_list, dim=-1)
+    # 3. 单独抽取 priv (特权信息)
+    priv_obs_list = []
+    if (root_height_obs):
+        priv_obs_list.append(root_pos[:, 2:3])
+    priv_obs_list.append(root_vel_obs)
+    if (len(key_pos) > 0):
+        priv_obs_list.append(key_pos_flat)
+    if len(push) > 0:
+        priv_obs_list.append(push)
+    priv_obs_tensor = torch.cat(priv_obs_list, dim=-1) if len(priv_obs_list) > 0 else torch.zeros(
+        (root_pos.shape[0], 0), device=root_pos.device)
+
+    # 2. 根据 asymmetric_obs 开关决定 Actor 观测
+    if asymmetric_obs:
+        # 无特权观测 (用于部署): 仅保留 root_rot, root_ang_vel, joint_rot, dof_vel
+        actor_obs_tensor = prop_obs_tensor
+    else:
+        # 对称模式：Actor 也能看到全部特权信息
+        actor_obs_tensor = full_obs_tensor
+
+    # return obs
+    return actor_obs_tensor, full_obs_tensor, prop_obs_tensor, priv_obs_tensor
+
 
 @torch.jit.script
 def compute_reward(root_pos):

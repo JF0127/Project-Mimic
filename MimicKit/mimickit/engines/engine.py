@@ -28,8 +28,9 @@ class Engine:
         return
     
     @abc.abstractmethod
-    def create_obj(self, env_id, obj_type, asset_file, name, is_visual=False, enable_self_collisions=True, 
-                     fix_root=False, start_pos=None, start_rot=None, color=None, disable_motors=False):
+    def create_obj(self, env_id, obj_type, asset_file, name, is_visual=False, enable_self_collisions=True,
+                     fix_root=False, start_pos=None, start_rot=None, color=None, disable_motors=False,
+                     init_joint_pos=None):
         return
 
     @abc.abstractmethod
