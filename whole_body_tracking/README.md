@@ -107,8 +107,8 @@ python scripts/replay_npz.py --registry_name={your-organization}-org/wandb-regis
 
 ```bash
 python scripts/rsl_rl/train.py --task=Tracking-Flat-G1-v0 \
---registry_name {your-organization}-org/wandb-registry-motions/{motion_name} \
---headless --logger wandb --log_project_name {project_name} --run_name {run_name}
+--registry_name jf0127-whu/wandb-registry-Motions/G1-Dance-Sub2:v0 \
+--headless --logger wandb --log_project_name G1-Dance --run_name Sub2
 ```
 
 ### Policy Evaluation

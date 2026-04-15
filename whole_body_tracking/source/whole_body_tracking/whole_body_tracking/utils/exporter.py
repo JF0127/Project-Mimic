@@ -30,7 +30,17 @@ def export_motion_policy_as_onnx(
 
 class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
     def __init__(self, env: ManagerBasedRLEnv, actor_critic, normalizer=None, verbose=False):
-        super().__init__(actor_critic, normalizer, verbose)
+        torch.nn.Module.__init__(self)
+        self.verbose = verbose
+        if hasattr(actor_critic, "as_onnx"):
+            self.policy = actor_critic.as_onnx(verbose=verbose)
+            self.policy.to("cpu")
+            self.policy.eval()
+            self.input_size = self.policy.get_dummy_inputs()[0].shape[-1]
+            self._use_wrapped_policy = True
+        else:
+            super().__init__(actor_critic, normalizer, verbose)
+            self._use_wrapped_policy = False
         cmd: MotionCommand = env.command_manager.get_term("motion")
 
         self.joint_pos = cmd.motion.joint_pos.to("cpu")
@@ -43,8 +53,12 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
 
     def forward(self, x, time_step):
         time_step_clamped = torch.clamp(time_step.long().squeeze(-1), max=self.time_step_total - 1)
+        if self._use_wrapped_policy:
+            actions = self.policy(x)
+        else:
+            actions = self.actor(self.normalizer(x))
         return (
-            self.actor(self.normalizer(x)),
+            actions,
             self.joint_pos[time_step_clamped],
             self.joint_vel[time_step_clamped],
             self.body_pos_w[time_step_clamped],
@@ -55,7 +69,7 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
 
     def export(self, path, filename):
         self.to("cpu")
-        obs = torch.zeros(1, self.actor[0].in_features)
+        obs = torch.zeros(1, self.input_size if self._use_wrapped_policy else self.actor[0].in_features)
         time_step = torch.zeros(1, 1)
         torch.onnx.export(
             self,

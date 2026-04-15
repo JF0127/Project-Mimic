@@ -1,0 +1,6 @@
+{
+    "python.analysis.extraPaths": [
+        "./thirdparty/IsaacLab/source/isaaclab",
+        "./whole_body_tracking/source/whole_body_tracking"
+    ]
+}

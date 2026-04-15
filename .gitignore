@@ -2,3 +2,7 @@ wyh/
 videos/
 .claude/
 .venv/
+data/
+logs/
+outputs/
+.codex
